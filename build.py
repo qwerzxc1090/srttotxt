@@ -140,6 +140,68 @@ def main() -> None:
     shutil.move(str(built_exe), str(final_path))
     print("빌드 완료:", final_path)
 
+    # ── GitHub Releases 자동 업로드 ──
+    upload_to_github_release(today, version, final_path)
+
+
+def upload_to_github_release(today: str, version: int, exe_path: Path) -> None:
+    """빌드된 exe를 GitHub Releases에 업로드한다."""
+    # gh CLI 존재 확인
+    try:
+        subprocess.run(
+            ["gh", "--version"],
+            capture_output=True, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("[SKIP] GitHub CLI(gh)가 설치되어 있지 않아 릴리스 업로드를 건너뜁니다.")
+        return
+
+    # 인증 확인
+    auth_check = subprocess.run(
+        ["gh", "auth", "status"],
+        capture_output=True, text=True,
+    )
+    if auth_check.returncode != 0:
+        print("[SKIP] GitHub 인증이 되어 있지 않아 릴리스 업로드를 건너뜁니다.")
+        print("  → 'gh auth login' 으로 인증 후 다시 시도하세요.")
+        return
+
+    tag = f"v{today}_V{version}"
+    release_title = f"{OUTPUT_BASENAME} {today} V{version}"
+    release_notes = f"Auto build release - {release_title}"
+
+    print(f"\n[UPLOAD] GitHub Release 업로드 시작... (태그: {tag})")
+
+    # git add + commit + push (변경사항이 있는 경우)
+    subprocess.run(["git", "add", "-A"], cwd=SCRIPT_DIR, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", f"Release {tag}"],
+        cwd=SCRIPT_DIR, capture_output=True,
+    )
+    subprocess.run(["git", "push"], cwd=SCRIPT_DIR, capture_output=True)
+
+    # 릴리스 생성 + exe 첨부
+    gh_cmd = [
+        "gh", "release", "create", tag,
+        str(exe_path),
+        "--title", release_title,
+        "--notes", release_notes,
+    ]
+    result = subprocess.run(gh_cmd, cwd=SCRIPT_DIR, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        release_url = result.stdout.strip()
+        download_url = (
+            f"https://github.com/qwerzxc1090/srttotxt/releases/download/"
+            f"{tag}/{exe_path.name}"
+        )
+        print(f"[OK] GitHub Release 업로드 성공!")
+        print(f"   릴리스 페이지: {release_url}")
+        print(f"   다운로드 URL : {download_url}")
+    else:
+        print(f"[FAIL] GitHub Release 업로드 실패:")
+        print(f"   {result.stderr.strip()}")
+
 
 if __name__ == "__main__":
     main()
