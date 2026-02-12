@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 자동 버전 관리 빌드 스크립트
-PyInstaller로 단일 실행 파일을 만들고, dist 내 오늘 날짜 기준 버전 번호(V1, V2, ...)로 저장.
+PyInstaller로 단일 실행 파일을 만들고, dist 내 순차 버전 번호(v0001, v0002, ...)로 저장.
 """
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -25,22 +25,18 @@ GEMINI_KEY_BUNDLE_FILENAME = "gemini_api_key_bundle.txt"
 
 
 def get_next_version() -> int:
-    """dist 폴더에서 오늘 날짜의 SubBridgeAI_YYYYMMDD_V*.exe 를 스캔해 다음 버전 번호 반환."""
-    today = datetime.now().strftime("%Y%m%d")
-    pattern = str(DIST_DIR / f"{OUTPUT_BASENAME}_{today}_V*.exe")
+    """dist 폴더에서 SubBridgeAI_v*.exe 를 스캔해 다음 버전 번호 반환."""
+    pattern = str(DIST_DIR / f"{OUTPUT_BASENAME}_v*.exe")
     files = glob.glob(pattern)
     if not files:
         return 1
     versions = []
     for f in files:
         name = os.path.basename(f)
-        try:
-            # SubBridgeAI_20231025_V2.exe -> 2
-            suffix = name.split("_V")[-1]
-            v = int(suffix.replace(".exe", "").strip())
-            versions.append(v)
-        except (ValueError, IndexError):
-            pass
+        # SubBridgeAI_v0003.exe -> 3
+        m = re.search(r"_v(\d+)\.exe$", name)
+        if m:
+            versions.append(int(m.group(1)))
     return max(versions) + 1 if versions else 1
 
 
@@ -80,8 +76,8 @@ def find_icon() -> Optional[str]:
 def main() -> None:
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     version = get_next_version()
-    today = datetime.now().strftime("%Y%m%d")
-    final_name = f"{OUTPUT_BASENAME}_{today}_V{version}.exe"
+    version_str = f"v{version:04d}"  # v0001, v0002, ...
+    final_name = f"{OUTPUT_BASENAME}_{version_str}.exe"
     final_path = DIST_DIR / final_name
 
     api_key = load_api_key_for_build()
@@ -141,10 +137,10 @@ def main() -> None:
     print("빌드 완료:", final_path)
 
     # ── GitHub Releases 자동 업로드 ──
-    upload_to_github_release(today, version, final_path)
+    upload_to_github_release(version_str, exe_path=final_path)
 
 
-def upload_to_github_release(today: str, version: int, exe_path: Path) -> None:
+def upload_to_github_release(version_str: str, exe_path: Path) -> None:
     """빌드된 exe를 GitHub Releases에 업로드한다."""
     # gh CLI 존재 확인
     try:
@@ -166,11 +162,11 @@ def upload_to_github_release(today: str, version: int, exe_path: Path) -> None:
         print("  → 'gh auth login' 으로 인증 후 다시 시도하세요.")
         return
 
-    tag = f"v{today}_V{version}"
-    release_title = f"{OUTPUT_BASENAME} {today} V{version}"
+    tag = version_str  # v0001, v0002, ...
+    release_title = f"{OUTPUT_BASENAME} {version_str}"
     release_notes = f"Auto build release - {release_title}"
 
-    print(f"\n[UPLOAD] GitHub Release 업로드 시작... (태그: {tag})")
+    print(f"\n[UPLOAD] GitHub Release upload start... (tag: {tag})")
 
     # git add + commit + push (변경사항이 있는 경우)
     subprocess.run(["git", "add", "-A"], cwd=SCRIPT_DIR, capture_output=True)
