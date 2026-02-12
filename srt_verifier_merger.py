@@ -1502,10 +1502,29 @@ class SrtVerifierMergerApp:
         else:
             err_msg = arg1 or "알 수 없는 오류"
             self._refresh_tree()
-            is_cancel = "중단" in str(err_msg)
+            is_cancel = "사용자 중단" in str(err_msg)
             self.status_var.set("AI 번역 중단." if is_cancel else "AI 번역 실패.")
             if is_cancel:
-                self._append_log("AI 번역 사용자 중단")
+                # 상세 중단 로그: "사용자 중단|모델|완료행|전체행|완료배치|전체배치|시작줄|마지막줄"
+                parts = str(err_msg).split("|")
+                if len(parts) >= 8:
+                    model_name = parts[1]
+                    done_rows, all_rows = parts[2], parts[3]
+                    done_batches, all_batches = parts[4], parts[5]
+                    first_line, last_line = parts[6], parts[7]
+                    self._append_log(
+                        f"AI 번역 사용자 중단 (모델: {model_name})"
+                    )
+                    if int(done_rows) > 0:
+                        self._append_log(
+                            f"  - 완료: {done_rows}/{all_rows}줄 "
+                            f"(Line {first_line}~{last_line}, "
+                            f"배치 {done_batches}/{all_batches})"
+                        )
+                    else:
+                        self._append_log("  - 완료된 번역 없음 (첫 배치 시작 전 중단)")
+                else:
+                    self._append_log("AI 번역 사용자 중단")
             elif "503_UNAVAILABLE" in str(err_msg):
                 failed_model = str(err_msg).split("|", 1)[1] if "|" in str(err_msg) else "알 수 없음"
                 self._append_log(f"AI 번역 실패: 모델({failed_model}) 일시 사용 불가 (503)")
@@ -1616,7 +1635,11 @@ class SrtVerifierMergerApp:
             for batch_idx, batch_start in enumerate(range(0, total, batch_size)):
                 # 모두 번역 모드에서 취소 요청이 들어오면 다음 배치부터 중단
                 if self._translate_all_mode_active and self._translate_all_cancel_requested:
-                    return (False, "사용자 중단", None)
+                    completed_rows = batch_start
+                    first_idx = self.rows[indices[0]].get("index", 1) if indices else 1
+                    last_idx = self.rows[indices[completed_rows - 1]].get("index", completed_rows) if completed_rows > 0 else 0
+                    cancel_info = f"사용자 중단|{chosen_name}|{completed_rows}|{total}|{batch_idx}|{num_batches}|{first_idx}|{last_idx}"
+                    return (False, cancel_info, None)
                 batch_end = min(batch_start + batch_size, total)
                 batch_indices = indices[batch_start:batch_end]
                 batch_rows = [self.rows[i] for i in batch_indices]
