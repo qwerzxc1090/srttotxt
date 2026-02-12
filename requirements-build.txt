@@ -1,0 +1,4 @@
+# 배포용 exe 빌드 시에만 설치
+# 사용: pip install -r requirements-build.txt
+pyinstaller>=6.0.0
+pillow>=10.0.0
