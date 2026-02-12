@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 자동 버전 관리 빌드 스크립트
-PyInstaller로 단일 실행 파일을 만들고, dist 내 순차 버전 번호(v0001, v0002, ...)로 저장.
+PyInstaller로 SubBridgeAI.exe 단일 실행 파일을 만들고, GitHub Releases 태그로 버전 관리.
 """
-import glob
-import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -25,19 +22,26 @@ GEMINI_KEY_BUNDLE_FILENAME = "gemini_api_key_bundle.txt"
 
 
 def get_next_version() -> int:
-    """dist 폴더에서 SubBridgeAI_v*.exe 를 스캔해 다음 버전 번호 반환."""
-    pattern = str(DIST_DIR / f"{OUTPUT_BASENAME}_v*.exe")
-    files = glob.glob(pattern)
-    if not files:
-        return 1
-    versions = []
-    for f in files:
-        name = os.path.basename(f)
-        # SubBridgeAI_v0003.exe -> 3
-        m = re.search(r"_v(\d+)\.exe$", name)
-        if m:
-            versions.append(int(m.group(1)))
-    return max(versions) + 1 if versions else 1
+    """GitHub Releases 태그(v0001, v0002, ...)를 스캔해 다음 버전 번호 반환."""
+    try:
+        result = subprocess.run(
+            ["gh", "release", "list", "--limit", "100"],
+            cwd=SCRIPT_DIR, capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            versions = []
+            for line in result.stdout.strip().splitlines():
+                # 태그는 탭 구분 컬럼 중 세 번째(0-indexed: 2)
+                parts = line.split("\t")
+                for part in parts:
+                    m = re.match(r"^v(\d+)$", part.strip())
+                    if m:
+                        versions.append(int(m.group(1)))
+            if versions:
+                return max(versions) + 1
+    except (FileNotFoundError, Exception):
+        pass
+    return 1
 
 
 def load_api_key_for_build() -> Optional[str]:
@@ -77,7 +81,7 @@ def main() -> None:
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     version = get_next_version()
     version_str = f"v{version:04d}"  # v0001, v0002, ...
-    final_name = f"{OUTPUT_BASENAME}_{version_str}.exe"
+    final_name = f"{OUTPUT_BASENAME}.exe"
     final_path = DIST_DIR / final_name
 
     api_key = load_api_key_for_build()
@@ -128,13 +132,11 @@ def main() -> None:
         print("빌드 실패. PyInstaller 반환 코드:", ret.returncode)
         sys.exit(1)
 
-    built_exe = DIST_DIR / f"{OUTPUT_BASENAME}.exe"
-    if not built_exe.exists():
-        print("빌드 결과물을 찾을 수 없습니다:", built_exe)
+    if not final_path.exists():
+        print("빌드 결과물을 찾을 수 없습니다:", final_path)
         sys.exit(1)
 
-    shutil.move(str(built_exe), str(final_path))
-    print("빌드 완료:", final_path)
+    print(f"빌드 완료: {final_path}  (GitHub 태그: {version_str})")
 
     # ── GitHub Releases 자동 업로드 ──
     upload_to_github_release(version_str, exe_path=final_path)
@@ -191,9 +193,14 @@ def upload_to_github_release(version_str: str, exe_path: Path) -> None:
             f"https://github.com/qwerzxc1090/srttotxt/releases/download/"
             f"{tag}/{exe_path.name}"
         )
-        print(f"[OK] GitHub Release 업로드 성공!")
-        print(f"   릴리스 페이지: {release_url}")
-        print(f"   다운로드 URL : {download_url}")
+        latest_url = (
+            f"https://github.com/qwerzxc1090/srttotxt/releases/latest/download/"
+            f"{exe_path.name}"
+        )
+        print(f"[OK] GitHub Release upload success!")
+        print(f"   Release page : {release_url}")
+        print(f"   Download URL : {download_url}")
+        print(f"   Latest URL   : {latest_url}")
     else:
         print(f"[FAIL] GitHub Release 업로드 실패:")
         print(f"   {result.stderr.strip()}")
