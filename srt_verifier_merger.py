@@ -7,13 +7,14 @@ Python 3 + tkinter / ttk 단일 파일 실행
 import json
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple, Set, Callable
 
 try:
     from PIL import Image
@@ -70,7 +71,7 @@ MANUAL_DETAILED = """■ SRT 자막 검수 및 병합 도구 (SubBridge) — 자
   • AI 번역하기: Gemini API로 원본 텍스트를 번역합니다. API 키는 exe/프로그램 폴더의 .env 파일에 GEMINI_API_KEY=... 로 넣어 주세요.
   • 모두 번역: 체크 시 [번역 범위]에 입력한 시작 번호부터 끝까지 전체를 번역합니다. 체크 해제 시 범위 입력(예: 1-10, 1,3,5)으로 구간만 번역(최대 50개).
   • 번역 범위: 일반 모드에서는 "1-10" 또는 "1,3,5" 형식. 모두 번역 모드에서는 시작 순번만 입력(예: 1).
-  • AI 모델: "자동 (API에서 선택)" 또는 gemini-2.5-flash 등 고정 모델 선택. 저장됩니다.
+  • AI 모델: 자동 또는 고정 모델(gemini-2.5-flash 등) 선택. 저장됩니다.
   • AI 번역 대상 언어: 번역 결과 언어(English, 한국어 등). 병합 파일명에도 반영됩니다.
   • 용어집 설정: "원본단어:번역단어" 한 줄씩 입력하면 AI 번역 시 해당 단어가 지정대로 번역됩니다. 설정 파일에 저장됩니다.
   • 추출하기: 원본 텍스트만 TXT로 저장. 오른쪽 언어 선택에 따라 파일명에 _EN, _KR 등이 붙습니다.
@@ -215,8 +216,8 @@ FONT_ROWHEIGHT: Dict[int, int] = {9: 24, 10: 26, 11: 28, 13: 32, 16: 38}
 FONT_COLUMN_WIDTH: Dict[int, int] = {9: 180, 10: 210, 11: 250, 13: 320, 16: 400}
 
 # AI 번역 모델 옵션 (Google AI Studio 텍스트 출력 모델 기준) — "자동"은 API 목록에서 첫 사용 가능 모델 사용
-AI_MODEL_AUTO = "자동 (API에서 선택)"
-AI_MODEL_FALLBACKS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
+AI_MODEL_AUTO = "자동"
+AI_MODEL_FALLBACKS = ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite")
 AI_MODEL_OPTIONS: List[str] = [
     AI_MODEL_AUTO,
     *AI_MODEL_FALLBACKS,
@@ -226,6 +227,56 @@ LANG_DISPLAYS: List[str] = [display for _, display in LANG_OPTIONS]
 FONT_LABELS: List[str] = [label for label, _ in FONT_SIZE_OPTIONS]
 DEFAULT_FONT_LABEL = "보통"
 DEFAULT_FONT_PT = 11
+
+# 모델별 성능 데이터 영구 저장 경로
+MODEL_PERF_PATH = _base_dir / "model_performance.json"
+
+
+class StatsManager:
+    """모델별 번역 성능 데이터를 영구 저장하고 평균 속도를 계산한다."""
+
+    def __init__(self, path: Path = MODEL_PERF_PATH):
+        self._path = path
+        self._data: Dict[str, Dict[str, float]] = {}
+        self._load()
+
+    # ── 내부 I/O ──
+
+    def _load(self) -> None:
+        if self._path.exists():
+            try:
+                self._data = json.loads(self._path.read_text(encoding="utf-8"))
+            except Exception:
+                self._data = {}
+
+    def _save(self) -> None:
+        try:
+            self._path.write_text(
+                json.dumps(self._data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    # ── 공개 API ──
+
+    def accumulate(self, model: str, elapsed_seconds: float, items: int) -> None:
+        """번역 완료 시 소요 시간과 처리 개수를 누적 합산한다."""
+        if not model or items <= 0 or elapsed_seconds <= 0:
+            return
+        if model not in self._data:
+            self._data[model] = {"total_time": 0.0, "total_items": 0}
+        self._data[model]["total_time"] += round(elapsed_seconds, 3)
+        self._data[model]["total_items"] += items
+        self._save()
+
+    def get_average(self, model: str) -> Optional[Tuple[float, int]]:
+        """(평균 초/개, 누적 총 개수) 반환. 데이터 없으면 None."""
+        entry = self._data.get(model)
+        if not entry or entry.get("total_items", 0) <= 0:
+            return None
+        avg = entry["total_time"] / entry["total_items"]
+        return (round(avg, 2), int(entry["total_items"]))
 
 
 # --- 데이터 계층 (UI와 로직 분리) --------------------------------------------
@@ -317,18 +368,25 @@ def _read_file_utf(path: str, encoding: str, error_title: str) -> Optional[str]:
 
 # --- 로그 뷰어 (메인 윈도우 우측 자석 배치, 이동 시 따라감) ---
 
+# 설정 파일 경로 (로그 창 크기 저장 — PREFS_PATH와 동일한 settings.json 사용)
+def _log_viewer_prefs_path() -> Path:
+    return PREFS_PATH
+
+
 class LogViewer:
     """AI 번역 등 작업 로그를 표시하는 별도 창. 메인 윈도우 우측에 붙어 따라 이동. 영구 저장·자동 정리."""
 
-    LOG_WIDTH = 480
-    LOG_HEIGHT = 400
+    LOG_DEFAULT_WIDTH = 480
+    LOG_DEFAULT_HEIGHT = 400
 
-    def __init__(self, parent: tk.Tk):
+    def __init__(self, parent: tk.Tk, on_user_close_callback: Optional[Callable[[], None]] = None):
         self.parent = parent
+        self.on_user_close = on_user_close_callback
         self.win: Optional[tk.Toplevel] = None
         self.text: Optional[ScrolledText] = None
         self._active = True  # False 시 Configure 콜백 무시
         self._entries: List[Dict[str, str]] = []  # {"ts": "...", "msg": "..."}
+        self._header_frame: Optional[ttk.Frame] = None
         self._load_history()
 
     # ---- 영구 저장 / 로드 ----
@@ -371,6 +429,46 @@ class LogViewer:
         self.text.see("end")
         self.text.config(state="disabled")
 
+    # ---- 크기 저장 / 로드 ----
+
+    def load_size(self) -> Tuple[int, int]:
+        """settings.json에서 저장된 로그 창 크기 로드. 없으면 기본값 반환."""
+        try:
+            path = _log_viewer_prefs_path()
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    prefs = json.load(f)
+                w = prefs.get("log_viewer_width")
+                h = prefs.get("log_viewer_height")
+                if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+                    w, h = int(w), int(h)
+                    if 200 <= w <= 2000 and 150 <= h <= 1500:
+                        return (w, h)
+        except Exception:
+            pass
+        return (self.LOG_DEFAULT_WIDTH, self.LOG_DEFAULT_HEIGHT)
+
+    def save_size(self) -> None:
+        """현재 로그 창 크기를 settings.json에 저장 (위치는 저장하지 않음)."""
+        if self.win is None or not self.win.winfo_exists():
+            return
+        try:
+            w = self.win.winfo_width()
+            h = self.win.winfo_height()
+            if w < 200 or h < 150:
+                return
+            path = _log_viewer_prefs_path()
+            prefs: Dict[str, Any] = {}
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    prefs = json.load(f)
+            prefs["log_viewer_width"] = w
+            prefs["log_viewer_height"] = h
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(prefs, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
     # ---- UI ----
 
     def _create_window(self) -> None:
@@ -381,7 +479,13 @@ class LogViewer:
         self.win.title("SubBridge — 로그")
         self.win.resizable(True, True)
         self.win.minsize(200, 150)
-        # Always on Top 사용 안 함 (메인 작업 우선)
+        lw, lh = self.load_size()
+        self.win.geometry(f"{lw}x{lh}")
+        self.win.protocol("WM_DELETE_WINDOW", self._on_user_close)
+        # 상단 헤더: 크기 초기화 버튼
+        self._header_frame = ttk.Frame(self.win)
+        self._header_frame.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Button(self._header_frame, text="크기 초기화", command=self._on_reset_size).pack(side="right")
         frame = ttk.Frame(self.win, padding=4)
         frame.pack(fill="both", expand=True)
         self.text = ScrolledText(frame, wrap="word", font=("Consolas", 9), height=20, width=40)
@@ -392,18 +496,36 @@ class LogViewer:
         self._update_position()
         self._bind_configure()
 
+    def _on_user_close(self) -> None:
+        """사용자가 로그 창 X 버튼 클릭 시: 크기 저장 → 숨김 → 체크박스 동기화."""
+        self.save_size()
+        if self.win and self.win.winfo_exists():
+            self.win.withdraw()
+        if self.on_user_close:
+            self.on_user_close()
+
+    def _on_reset_size(self) -> None:
+        """크기 초기화 버튼: 기본 크기로 복원."""
+        if self.win is None or not self.win.winfo_exists():
+            return
+        self.win.geometry(f"{self.LOG_DEFAULT_WIDTH}x{self.LOG_DEFAULT_HEIGHT}")
+        self._update_position()
+
     def _update_position(self) -> None:
-        """메인 윈도우 우측에 로그 창 위치 설정."""
+        """메인 윈도우 우측에 로그 창 위치 설정 (자석 효과). 크기는 유지."""
         if self.win is None or not self.win.winfo_exists():
             return
         try:
             self.parent.update_idletasks()
+            self.win.update_idletasks()
             mx = self.parent.winfo_x()
             my = self.parent.winfo_y()
             mw = self.parent.winfo_width()
+            w = self.win.winfo_width()
+            h = self.win.winfo_height()
             x = mx + mw
             y = my
-            self.win.geometry(f"{self.LOG_WIDTH}x{self.LOG_HEIGHT}+{x}+{y}")
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
         except (tk.TclError, Exception):
             pass
 
@@ -417,11 +539,24 @@ class LogViewer:
         pass
 
     def show(self) -> None:
-        """로그 창 표시 (없으면 생성)."""
+        """로그 창 표시 (없으면 생성, 숨김 상태면 복원)."""
         self._create_window()
         if self.win:
+            try:
+                self.win.deiconify()
+            except tk.TclError:
+                pass
             self.win.lift()
             self.win.focus_set()
+
+    def hide(self) -> None:
+        """로그 창 숨김 (withdraw). 크기 저장 후 숨김."""
+        if self.win and self.win.winfo_exists():
+            self.save_size()
+            try:
+                self.win.withdraw()
+            except tk.TclError:
+                pass
 
     def append(self, message: str) -> None:
         """로그 메시지 추가 (타임스탬프 자동, 영구 저장, 자동 정리)."""
@@ -451,9 +586,10 @@ class LogViewer:
             self.text.config(state="disabled")
 
     def destroy(self) -> None:
-        """로그 창 종료."""
+        """로그 창 종료. 종료 전 크기 저장."""
         self._active = False
         if self.win and self.win.winfo_exists():
+            self.save_size()
             self.win.destroy()
         self.win = None
         self.text = None
@@ -542,6 +678,9 @@ class SrtVerifierMergerApp:
         self._translate_all_mode_active: bool = False
 
         self._log_viewer: Optional[LogViewer] = None  # AI 번역 등 로그 창
+        self._log_viewer_visible_var = tk.BooleanVar(value=False)  # 작업 내용 체크박스
+        self._stats_manager = StatsManager()  # 모델별 누적 성능 데이터
+        self._translation_start_time: float = 0.0  # 번역 시작 시각 (time.time())
         self._icon_photo: Optional[Any] = None  # 창 아이콘 참조 유지
         write_readme()  # 실행 시 readme.txt 생성(간단·세부 메뉴얼 기록, 실행 없이 읽기용)
         self._build_ui()
@@ -560,7 +699,7 @@ class SrtVerifierMergerApp:
         self._update_translate_all_dialog_position()
 
     def _update_translate_all_dialog_position(self) -> None:
-        """프로그레스바 창을 메인 윈도우 바로 좌측에 배치."""
+        """프로그레스바 창을 메인 윈도우 상단 좌측에 배치 (좌측 정렬, 위에 붙음)."""
         if self._translate_all_dialog is None or not self._translate_all_dialog.winfo_exists():
             return
         try:
@@ -568,19 +707,32 @@ class SrtVerifierMergerApp:
             mx = self.root.winfo_x()
             my = self.root.winfo_y()
             self._translate_all_dialog.update_idletasks()
-            dw = self._translate_all_dialog.winfo_width()
-            x = max(0, mx - dw)
-            y = my
+            dh = self._translate_all_dialog.winfo_height()
+            x = mx
+            y = max(0, my - dh - 30)
             self._translate_all_dialog.geometry(f"+{x}+{y}")
         except (tk.TclError, Exception):
             pass
 
     def _ensure_log_viewer(self) -> LogViewer:
-        """로그 뷰어 생성·표시. 없으면 생성 후 메인 윈도우 우측에 배치."""
+        """로그 뷰어 생성·표시. 없으면 생성 후 메인 윈도우 우측에 배치. 체크박스 동기화."""
         if self._log_viewer is None:
-            self._log_viewer = LogViewer(self.root)
+            self._log_viewer = LogViewer(
+                self.root,
+                on_user_close_callback=lambda: self._log_viewer_visible_var.set(False),
+            )
+        self._log_viewer_visible_var.set(True)
         self._log_viewer.show()
         return self._log_viewer
+
+    def _on_log_viewer_visible_toggled(self) -> None:
+        """작업 내용 체크박스 토글: 로그 창 표시/숨김."""
+        if self._log_viewer_visible_var.get():
+            self._ensure_log_viewer()
+        else:
+            if self._log_viewer:
+                self._log_viewer.hide()
+        self._save_preferences()
 
     def _append_log(self, message: str) -> None:
         """로그 메시지 추가 (메인 스레드에서만 호출). 로그 창이 없으면 생성."""
@@ -693,7 +845,7 @@ class SrtVerifierMergerApp:
         ttk.Label(top, text="AI 모델:").grid(row=0, column=6, padx=(8, 2))
         self.ai_model_combo = ttk.Combobox(top, values=AI_MODEL_OPTIONS, state="readonly", width=18)
         self.ai_model_combo.grid(row=0, column=7, padx=2)
-        self.ai_model_combo.bind("<<ComboboxSelected>>", lambda e: self._save_preferences())
+        self.ai_model_combo.bind("<<ComboboxSelected>>", self._on_ai_model_changed)
         self.ai_lang_combo = ttk.Combobox(top, values=LANG_DISPLAYS, state="readonly", width=10)
         self.ai_lang_combo.grid(row=0, column=8, padx=4)
         self.ai_lang_combo.bind("<<ComboboxSelected>>", lambda e: self._save_preferences())
@@ -702,10 +854,22 @@ class SrtVerifierMergerApp:
         top.columnconfigure(10, weight=1)
         self.merge_btn = ttk.Button(top, text="병합하기(Merge)", command=self._on_merge)
         self.merge_btn.grid(row=0, column=11, padx=4)
-        ttk.Label(top, text="글자 크기:").grid(row=0, column=12, padx=(12, 4))
+        self.log_viewer_chk = ttk.Checkbutton(
+            top,
+            text="작업 내용",
+            variable=self._log_viewer_visible_var,
+            command=self._on_log_viewer_visible_toggled,
+        )
+        self.log_viewer_chk.grid(row=0, column=12, padx=(8, 4))
+        ttk.Label(top, text="글자 크기:").grid(row=0, column=13, padx=(12, 4))
         self.font_size_combo = ttk.Combobox(top, values=FONT_LABELS, state="readonly", width=10)
-        self.font_size_combo.grid(row=0, column=13, padx=(0, 4))
+        self.font_size_combo.grid(row=0, column=14, padx=(0, 4))
         self.font_size_combo.bind("<<ComboboxSelected>>", lambda e: self._on_font_size_changed())
+
+        # 모델 평균 속도 라벨 (AI 모델 콤보박스 아래)
+        self._model_speed_var = tk.StringVar(value="")
+        self._model_speed_label = ttk.Label(top, textvariable=self._model_speed_var, foreground="#555555", font=("", 8))
+        self._model_speed_label.grid(row=1, column=6, columnspan=2, sticky="w", padx=(8, 2))
 
         # 2행: 추출하기 그룹 (AI 번역하기와 같은 시작 컬럼)
         self.export_btn = ttk.Button(top, text="추출하기", command=self._on_export)
@@ -1117,10 +1281,25 @@ class SrtVerifierMergerApp:
         self.ai_lang_combo.set(ai_lang if ai_lang in LANG_DISPLAYS else LANG_DISPLAYS[0])
         # AI 모델 (기본: 자동)
         ai_model = prefs.get("ai_model", AI_MODEL_AUTO)
+        if ai_model == "자동 (API에서 선택)":
+            ai_model = AI_MODEL_AUTO
         self.ai_model_combo.set(ai_model if ai_model in AI_MODEL_OPTIONS else AI_MODEL_AUTO)
         # 사용자 정의 용어집
         self._glossary_text = prefs.get("glossary", "") or ""
+        # 작업 내용(로그 창) 표시 여부
+        log_visible = prefs.get("log_viewer_visible", False)
+        self._log_viewer_visible_var.set(log_visible)
         self._apply_viewer_font()
+        # 모델별 평균 속도 라벨 초기 표시
+        self._update_model_speed_label()
+        # 로그 창 표시가 저장되어 있으면 지연 표시 (UI 준비 후)
+        if log_visible:
+            self.root.after(100, self._show_log_viewer_if_checked)
+
+    def _show_log_viewer_if_checked(self) -> None:
+        """체크박스가 체크되어 있으면 로그 창 표시 (초기 로드용)."""
+        if self._log_viewer_visible_var.get():
+            self._ensure_log_viewer()
 
     def _save_preferences(self):
         """언어·글자 크기 설정 저장 (변경 시·종료 시)."""
@@ -1134,6 +1313,7 @@ class SrtVerifierMergerApp:
             prefs["ai_lang"] = self.ai_lang_combo.get()
             prefs["ai_model"] = self.ai_model_combo.get()
             prefs["glossary"] = self._glossary_text
+            prefs["log_viewer_visible"] = self._log_viewer_visible_var.get()
             with open(PREFS_PATH, "w", encoding="utf-8") as f:
                 json.dump(prefs, f, ensure_ascii=False)
         except Exception:
@@ -1194,6 +1374,36 @@ class SrtVerifierMergerApp:
             self.translate_range_var.set(TRANSLATE_RANGE_PLACEHOLDER)
             self._translate_range_placeholder_active = True
             return
+
+    def _on_ai_model_changed(self, event=None) -> None:
+        """AI 모델 콤보박스 변경 시: 환경설정 저장 + 평균 속도 라벨 갱신."""
+        self._save_preferences()
+        self._update_model_speed_label()
+
+    def _update_model_speed_label(self) -> None:
+        """현재 선택된 AI 모델의 누적 평균 속도를 라벨에 표시."""
+        selected = (self.ai_model_combo.get() or "").strip()
+        if not selected or selected == AI_MODEL_AUTO:
+            # "자동" 모드: 모든 모델의 합산 평균 표시
+            all_data = self._stats_manager._data
+            total_time = sum(v.get("total_time", 0) for v in all_data.values())
+            total_items = sum(v.get("total_items", 0) for v in all_data.values())
+            if total_items > 0:
+                avg = total_time / total_items
+                self._model_speed_var.set(
+                    f"평균 {avg:.2f}s/개 ({total_items:,}개)"
+                )
+            else:
+                self._model_speed_var.set("")
+            return
+        result = self._stats_manager.get_average(selected)
+        if result is not None:
+            avg, count = result
+            self._model_speed_var.set(
+                f"평균 {avg:.2f}s/개 ({count:,}개)"
+            )
+        else:
+            self._model_speed_var.set("")
 
     def _on_translate_all_toggled(self) -> None:
         """모두 번역 체크박스 토글 시 입력 힌트 초기화."""
@@ -1469,7 +1679,7 @@ class SrtVerifierMergerApp:
         if self._translate_all_status_var is not None:
             self._translate_all_status_var.set("취소 요청 중... 현재 배치 완료 후 중단됩니다.")
 
-    def _on_translation_done(self, success: bool, arg1: Any, arg2: Any) -> None:
+    def _on_translation_done(self, success: bool, arg1: Any, arg2: Any, elapsed: float = 0.0) -> None:
         """번역 스레드 완료 시 메인 스레드에서 호출: 100% 강제, 타이머 중지, UI 갱신 후 0.5초 뒤 바 숨김."""
          # 모두 번역 진행 다이얼로그 정리
         if self._translate_all_dialog is not None and self._translate_all_dialog.winfo_exists():
@@ -1496,9 +1706,23 @@ class SrtVerifierMergerApp:
             self.tree.heading("translated", text="번역 텍스트 (AI)")
             self._update_merge_button_state()
             model_label = chosen_name or "알 수 없음"
-            self.status_var.set(f"AI 번역 완료. (모델: {model_label}, 총 {total}줄)")
-            self._append_log(f"AI 번역 완료 (모델: {model_label}, 총 {total}줄)")
-            messagebox.showinfo("AI 번역 완료", f"모델: {model_label}\n총 {total}줄 번역 완료.")
+            per_line = (elapsed / total) if (elapsed > 0 and total > 0) else 0
+            speed_info = f", {elapsed:.1f}s, {per_line:.2f}s/ea" if elapsed > 0 else ""
+            self.status_var.set(f"AI 번역 완료. (모델: {model_label}, 총 {total}줄{speed_info})")
+            # 누적 성능 데이터 저장 후 로그 출력 (역대 평균 계산용)
+            if chosen_name and elapsed > 0 and total > 0:
+                self._stats_manager.accumulate(chosen_name, elapsed, total)
+                self._update_model_speed_label()
+            # 로그: 작업 평균 vs 누적 평균 (가독성 강화)
+            cum = self._stats_manager.get_average(chosen_name) if chosen_name else None
+            cum_str = f"{cum[0]:.2f}s/개 (총 {cum[1]:,}개 기준)" if cum else "(데이터 수집 중...)"
+            self._append_log(
+                "[OK] [작업 완료] 모든 번역이 끝났습니다.\n"
+                f"[Stats] 작업 내역 (Model: {model_label})\n"
+                f"   |- 작업 평균: {per_line:.2f}s/개\n"
+                f"   |- 누적 평균: {cum_str}"
+            )
+            messagebox.showinfo("AI 번역 완료", f"모델: {model_label}\n총 {total}줄 번역 완료.\n소요 시간: {elapsed:.1f}초 ({per_line:.2f}s/줄)")
         else:
             err_msg = arg1 or "알 수 없는 오류"
             self._refresh_tree()
@@ -1512,15 +1736,21 @@ class SrtVerifierMergerApp:
                     done_rows, all_rows = parts[2], parts[3]
                     done_batches, all_batches = parts[4], parts[5]
                     first_line, last_line = parts[6], parts[7]
+                    done_rows_int = int(done_rows)
+                    per_line_cancel = (elapsed / done_rows_int) if (elapsed > 0 and done_rows_int > 0) else 0
                     self._append_log(
-                        f"AI 번역 사용자 중단 (모델: {model_name})"
+                        f"AI 번역 사용자 중단 (모델: {model_name}, {elapsed:.1f}초, {per_line_cancel:.2f}s/ea)"
                     )
-                    if int(done_rows) > 0:
+                    if done_rows_int > 0:
                         self._append_log(
                             f"  - 완료: {done_rows}/{all_rows}줄 "
                             f"(Line {first_line}~{last_line}, "
                             f"배치 {done_batches}/{all_batches})"
                         )
+                        # 중단 시에도 완료된 부분만큼 누적 성능 데이터 저장
+                        if model_name and elapsed > 0:
+                            self._stats_manager.accumulate(model_name, elapsed, done_rows_int)
+                            self._update_model_speed_label()
                     else:
                         self._append_log("  - 완료된 번역 없음 (첫 배치 시작 전 중단)")
                 else:
@@ -1554,7 +1784,7 @@ class SrtVerifierMergerApp:
                     "해결 방법:\n"
                     "• 잠시(1~5분) 후 다시 시도해 보세요.\n"
                     f"{alt_hint}\n"
-                    "• '자동 (API에서 선택)'을 사용하면 가용 모델을 자동으로 찾습니다.",
+                    "• '자동'을 사용하면 가용 모델을 자동으로 찾습니다.",
                 )
             else:
                 err_text = str(err_msg).strip() or "알 수 없는 오류"
@@ -1719,10 +1949,12 @@ class SrtVerifierMergerApp:
         row_indices_0based: Optional[List[int]] = None,
     ) -> None:
         """워커 스레드 엔트리: 번역 실행 후 메인 스레드에 완료 콜백 예약."""
+        self._translation_start_time = time.time()
         result = self._do_translation_work(
             api_key, target_lang, selected_model, use_auto, total, batch_size, num_batches, glossary_text, row_indices_0based
         )
-        self.root.after(0, lambda: self._on_translation_done(result[0], result[1], result[2]))
+        elapsed = time.time() - self._translation_start_time
+        self.root.after(0, lambda: self._on_translation_done(result[0], result[1], result[2], elapsed))
 
     def _on_ai_translate(self):
         """AI 번역하기: Fake Progress 표시 후 백그라운드 스레드에서 Gemini API 번역 실행."""

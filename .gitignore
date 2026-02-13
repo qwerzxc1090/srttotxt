@@ -16,9 +16,10 @@ __pycache__/
 .env.*
 gemini_api_key_bundle.txt
 
-# Logs
+# Logs & stats
 log/
 log_history.json
+model_performance.json
 
 # IDE / Editor
 .vscode/
