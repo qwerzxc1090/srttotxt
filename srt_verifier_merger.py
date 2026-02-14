@@ -218,10 +218,31 @@ FONT_COLUMN_WIDTH: Dict[int, int] = {9: 180, 10: 210, 11: 250, 13: 320, 16: 400}
 # AI 번역 모델 옵션 (Google AI Studio 텍스트 출력 모델 기준) — "자동"은 API 목록에서 첫 사용 가능 모델 사용
 AI_MODEL_AUTO = "자동"
 AI_MODEL_FALLBACKS = ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite")
-AI_MODEL_OPTIONS: List[str] = [
-    AI_MODEL_AUTO,
-    *AI_MODEL_FALLBACKS,
-]
+AI_MODEL_IDS: List[str] = [AI_MODEL_AUTO, *AI_MODEL_FALLBACKS]
+
+# 모델 ID → UI 표시명 (품질 제외)
+MODEL_ID_TO_DISPLAY_NAME: Dict[str, str] = {
+    "gemini-2.5-pro": "Gemini 2.5 Pro",
+    "gemini-2.5-flash": "Gemini 2.5 Flash",
+    "gemini-2.5-flash-lite": "Gemini 2.5 Flash-Lite",
+}
+
+# 모델 ID → 품질 등급 (상/중/하/-)
+MODEL_QUALITY: Dict[str, str] = {
+    "gemini-2.5-pro": "상",
+    "gemini-2.5-flash": "중",
+    "gemini-2.5-flash-lite": "하",
+}
+
+
+def _model_quality_for_id(model_id: str) -> str:
+    """모델 ID에 해당하는 품질 등급 반환."""
+    return MODEL_QUALITY.get(model_id, "-")
+
+
+def _model_display_name_for_id(model_id: str) -> str:
+    """모델 ID에 해당하는 UI 표시명 반환."""
+    return MODEL_ID_TO_DISPLAY_NAME.get(model_id, model_id)
 # UI용 라벨 목록 (한 번만 생성)
 LANG_DISPLAYS: List[str] = [display for _, display in LANG_OPTIONS]
 FONT_LABELS: List[str] = [label for label, _ in FONT_SIZE_OPTIONS]
@@ -230,6 +251,12 @@ DEFAULT_FONT_PT = 11
 
 # 모델별 성능 데이터 영구 저장 경로
 MODEL_PERF_PATH = _base_dir / "model_performance.json"
+
+# 로그 창: 예외/경고 메시지 강조용 패턴 (이 패턴이 포함되면 주황색으로 표시)
+LOG_HIGHLIGHT_PATTERNS = (
+    "빈 줄", "실패", "오류", "503", "중단", "불일치", "경고",
+    "통신 오류", "보정", "일시 사용 불가", "데이터 없음", "한도",
+)
 
 
 class StatsManager:
@@ -417,6 +444,10 @@ class LogViewer:
             self._save_history()
             self._rebuild_text_widget()
 
+    def _is_highlight_msg(self, msg: str) -> bool:
+        """예외/경고 메시지 여부 — 강조 색상 적용 대상."""
+        return any(p in (msg or "") for p in LOG_HIGHLIGHT_PATTERNS)
+
     def _rebuild_text_widget(self) -> None:
         """텍스트 위젯을 현재 _entries 기준으로 다시 그림."""
         if self.text is None or not self.text.winfo_exists():
@@ -424,8 +455,12 @@ class LogViewer:
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
         for entry in self._entries:
-            line = f"[{entry.get('ts', '')}] {entry.get('msg', '')}\n"
-            self.text.insert("end", line)
+            msg = entry.get("msg", "")
+            line = f"[{entry.get('ts', '')}] {msg}\n"
+            if self._is_highlight_msg(msg):
+                self.text.insert("end", line, "log_highlight")
+            else:
+                self.text.insert("end", line)
         self.text.see("end")
         self.text.config(state="disabled")
 
@@ -491,6 +526,7 @@ class LogViewer:
         self.text = ScrolledText(frame, wrap="word", font=("Consolas", 9), height=20, width=40)
         self.text.pack(fill="both", expand=True)
         self.text.config(state="disabled")  # 편집 불가, append만
+        self.text.tag_configure("log_highlight", foreground="#D35400")  # 예외/경고 메시지 강조 (주황)
         # 저장된 이전 로그를 텍스트 위젯에 복원
         self._rebuild_text_widget()
         self._update_position()
@@ -535,8 +571,16 @@ class LogViewer:
             self._update_position()
 
     def _bind_configure(self) -> None:
-        """LogViewer 자체 바인딩은 사용하지 않음 — 앱에서 통합 관리."""
-        pass
+        """로그 창 크기 변경 시 맨 아래 로그로 스크롤."""
+        if self.win and self.win.winfo_exists():
+            self.win.bind("<Configure>", self._on_log_win_configure)
+
+    def _on_log_win_configure(self, event: tk.Event) -> None:
+        """로그 창 리사이즈 시 가장 아래쪽 메시지로 포커싱."""
+        if event.widget != self.win:
+            return
+        if self.text and self.text.winfo_exists():
+            self.text.see("end")
 
     def show(self) -> None:
         """로그 창 표시 (없으면 생성, 숨김 상태면 복원)."""
@@ -568,7 +612,10 @@ class LogViewer:
         if self.text is not None and self.text.winfo_exists():
             line = f"[{ts}] {message}\n"
             self.text.config(state="normal")
-            self.text.insert("end", line)
+            if self._is_highlight_msg(message):
+                self.text.insert("end", line, "log_highlight")
+            else:
+                self.text.insert("end", line)
             self.text.see("end")
             self.text.config(state="disabled")
         # 개수 초과 체크 → 자동 정리
@@ -843,7 +890,11 @@ class SrtVerifierMergerApp:
         self.translate_range_entry.bind("<KeyPress>", self._on_translate_range_keypress)
 
         ttk.Label(top, text="AI 모델:").grid(row=0, column=6, padx=(8, 2))
-        self.ai_model_combo = ttk.Combobox(top, values=AI_MODEL_OPTIONS, state="readonly", width=18)
+        # Init 시 1회만 누적 데이터 로드하여 표시 리스트 생성
+        self._model_display_list, self._model_display_to_id = self._build_model_combo_display_list()
+        self.ai_model_combo = ttk.Combobox(
+            top, values=self._model_display_list, state="readonly", width=32
+        )
         self.ai_model_combo.grid(row=0, column=7, padx=2)
         self.ai_model_combo.bind("<<ComboboxSelected>>", self._on_ai_model_changed)
         self.ai_lang_combo = ttk.Combobox(top, values=LANG_DISPLAYS, state="readonly", width=10)
@@ -865,11 +916,6 @@ class SrtVerifierMergerApp:
         self.font_size_combo = ttk.Combobox(top, values=FONT_LABELS, state="readonly", width=10)
         self.font_size_combo.grid(row=0, column=14, padx=(0, 4))
         self.font_size_combo.bind("<<ComboboxSelected>>", lambda e: self._on_font_size_changed())
-
-        # 모델 평균 속도 라벨 (AI 모델 콤보박스 아래)
-        self._model_speed_var = tk.StringVar(value="")
-        self._model_speed_label = ttk.Label(top, textvariable=self._model_speed_var, foreground="#555555", font=("", 8))
-        self._model_speed_label.grid(row=1, column=6, columnspan=2, sticky="w", padx=(8, 2))
 
         # 2행: 추출하기 그룹 (AI 번역하기와 같은 시작 컬럼)
         self.export_btn = ttk.Button(top, text="추출하기", command=self._on_export)
@@ -1279,19 +1325,21 @@ class SrtVerifierMergerApp:
         # AI 번역 대상 언어 (기본: 영어)
         ai_lang = prefs.get("ai_lang", LANG_DISPLAYS[0])
         self.ai_lang_combo.set(ai_lang if ai_lang in LANG_DISPLAYS else LANG_DISPLAYS[0])
-        # AI 모델 (기본: 자동)
+        # AI 모델 (기본: 자동) — 저장된 model_id를 표시 텍스트로 매핑
         ai_model = prefs.get("ai_model", AI_MODEL_AUTO)
         if ai_model == "자동 (API에서 선택)":
             ai_model = AI_MODEL_AUTO
-        self.ai_model_combo.set(ai_model if ai_model in AI_MODEL_OPTIONS else AI_MODEL_AUTO)
+        display = self._get_display_for_model_id(ai_model)
+        if display is not None and display in self._model_display_list:
+            self.ai_model_combo.set(display)
+        else:
+            self.ai_model_combo.set(AI_MODEL_AUTO)
         # 사용자 정의 용어집
         self._glossary_text = prefs.get("glossary", "") or ""
         # 작업 내용(로그 창) 표시 여부
         log_visible = prefs.get("log_viewer_visible", False)
         self._log_viewer_visible_var.set(log_visible)
         self._apply_viewer_font()
-        # 모델별 평균 속도 라벨 초기 표시
-        self._update_model_speed_label()
         # 로그 창 표시가 저장되어 있으면 지연 표시 (UI 준비 후)
         if log_visible:
             self.root.after(100, self._show_log_viewer_if_checked)
@@ -1311,7 +1359,7 @@ class SrtVerifierMergerApp:
             prefs["lang_code"] = self._get_selected_lang_code()
             prefs["font_size"] = self.font_size_combo.get()
             prefs["ai_lang"] = self.ai_lang_combo.get()
-            prefs["ai_model"] = self.ai_model_combo.get()
+            prefs["ai_model"] = self._get_selected_model_id()
             prefs["glossary"] = self._glossary_text
             prefs["log_viewer_visible"] = self._log_viewer_visible_var.get()
             with open(PREFS_PATH, "w", encoding="utf-8") as f:
@@ -1375,35 +1423,53 @@ class SrtVerifierMergerApp:
             self._translate_range_placeholder_active = True
             return
 
-    def _on_ai_model_changed(self, event=None) -> None:
-        """AI 모델 콤보박스 변경 시: 환경설정 저장 + 평균 속도 라벨 갱신."""
-        self._save_preferences()
-        self._update_model_speed_label()
-
-    def _update_model_speed_label(self) -> None:
-        """현재 선택된 AI 모델의 누적 평균 속도를 라벨에 표시."""
-        selected = (self.ai_model_combo.get() or "").strip()
-        if not selected or selected == AI_MODEL_AUTO:
-            # "자동" 모드: 모든 모델의 합산 평균 표시
-            all_data = self._stats_manager._data
-            total_time = sum(v.get("total_time", 0) for v in all_data.values())
-            total_items = sum(v.get("total_items", 0) for v in all_data.values())
-            if total_items > 0:
-                avg = total_time / total_items
-                self._model_speed_var.set(
-                    f"평균 {avg:.2f}s/개 ({total_items:,}개)"
-                )
+    def _build_model_combo_display_list(self) -> Tuple[List[str], Dict[str, str]]:
+        """
+        Init 시 1회만 호출. model_performance.json 기준으로 표시 리스트 생성.
+        반환: (표시 텍스트 리스트, display_text -> model_id 딕셔너리)
+        """
+        display_list: List[str] = [AI_MODEL_AUTO]
+        display_to_id: Dict[str, str] = {AI_MODEL_AUTO: AI_MODEL_AUTO}
+        for model_id in AI_MODEL_FALLBACKS:
+            display_name = _model_display_name_for_id(model_id)
+            quality = _model_quality_for_id(model_id)
+            avg_result = self._stats_manager.get_average(model_id)
+            if avg_result is not None:
+                avg, count = avg_result
+                speed_str = f"{avg:.2f}s/개"
             else:
-                self._model_speed_var.set("")
-            return
-        result = self._stats_manager.get_average(selected)
-        if result is not None:
-            avg, count = result
-            self._model_speed_var.set(
-                f"평균 {avg:.2f}s/개 ({count:,}개)"
-            )
-        else:
-            self._model_speed_var.set("")
+                speed_str = "데이터 없음"
+            display_text = f"{display_name} ({speed_str}, 품질:{quality})"
+            display_list.append(display_text)
+            display_to_id[display_text] = model_id
+        return (display_list, display_to_id)
+
+    def _get_selected_model_id(self) -> str:
+        """콤보박스 선택값에서 실제 API용 모델 ID 추출."""
+        display = (self.ai_model_combo.get() or "").strip()
+        if not display:
+            return AI_MODEL_AUTO
+        model_id = self._model_display_to_id.get(display)
+        if model_id is not None:
+            return model_id
+        if display == AI_MODEL_AUTO:
+            return AI_MODEL_AUTO
+        if display in AI_MODEL_IDS:
+            return display
+        return AI_MODEL_AUTO
+
+    def _get_display_for_model_id(self, model_id: str) -> Optional[str]:
+        """모델 ID에 해당하는 콤보박스 표시 텍스트 반환."""
+        if model_id == AI_MODEL_AUTO:
+            return AI_MODEL_AUTO
+        for disp, mid in self._model_display_to_id.items():
+            if mid == model_id:
+                return disp
+        return None
+
+    def _on_ai_model_changed(self, event=None) -> None:
+        """AI 모델 콤보박스 변경 시: 환경설정 저장."""
+        self._save_preferences()
 
     def _on_translate_all_toggled(self) -> None:
         """모두 번역 체크박스 토글 시 입력 힌트 초기화."""
@@ -1712,7 +1778,6 @@ class SrtVerifierMergerApp:
             # 누적 성능 데이터 저장 후 로그 출력 (역대 평균 계산용)
             if chosen_name and elapsed > 0 and total > 0:
                 self._stats_manager.accumulate(chosen_name, elapsed, total)
-                self._update_model_speed_label()
             # 로그: 작업 평균 vs 누적 평균 (가독성 강화)
             cum = self._stats_manager.get_average(chosen_name) if chosen_name else None
             cum_str = f"{cum[0]:.2f}s/개 (총 {cum[1]:,}개 기준)" if cum else "(데이터 수집 중...)"
@@ -1750,7 +1815,6 @@ class SrtVerifierMergerApp:
                         # 중단 시에도 완료된 부분만큼 누적 성능 데이터 저장
                         if model_name and elapsed > 0:
                             self._stats_manager.accumulate(model_name, elapsed, done_rows_int)
-                            self._update_model_speed_label()
                     else:
                         self._append_log("  - 완료된 번역 없음 (첫 배치 시작 전 중단)")
                 else:
@@ -2007,7 +2071,7 @@ class SrtVerifierMergerApp:
             batch_size = AI_TRANSLATE_BATCH_SIZE
 
         num_batches = (total + batch_size - 1) // batch_size
-        selected_model = (self.ai_model_combo.get() or "").strip()
+        selected_model = self._get_selected_model_id()
         use_auto = not selected_model or selected_model == AI_MODEL_AUTO
         glossary_text = self._glossary_text or ""
 

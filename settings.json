@@ -2,9 +2,9 @@
   "lang_code": "EN",
   "font_size": "보통",
   "ai_lang": "Русский",
-  "ai_model": "gemini-2.5-flash",
+  "ai_model": "gemini-2.5-pro",
   "glossary": "",
   "log_viewer_visible": true,
-  "log_viewer_width": 480,
-  "log_viewer_height": 400
+  "log_viewer_width": 643,
+  "log_viewer_height": 926
 }
