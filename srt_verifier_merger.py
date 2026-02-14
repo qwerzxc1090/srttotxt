@@ -35,6 +35,7 @@ except ImportError:
 # 설정 파일 경로 (언어 선택 저장) — exe 실행 시 exe와 같은 폴더에 저장
 _base_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 PREFS_PATH = _base_dir / "settings.json"
+GLOSSARY_PATH = _base_dir / "glossary.json"
 README_PATH = _base_dir / "readme.txt"
 # Gemini API 키를 읽을 .env 후보 (배포 exe에서는 exe 폴더만 사용, 개발 시에만 GEMINI_ENV_PATH 추가)
 GEMINI_ENV_PATH = Path(r"C:\cursor2\ai-chatbot-app\ai-chatbot\.env.local")
@@ -186,6 +187,10 @@ AI_TRANSLATE_RANGE_MAX = 50
 TRANSLATE_RANGE_PLACEHOLDER = "예: 1-10 또는 1,3,5 (최대 50개)"
 # AI 번역 결과가 빈 줄/내용 없을 때 표시 (라인 밀림 방지)
 AI_TRANSLATE_EMPTY_PLACEHOLDER = "<빈줄>"
+# QA: 번역 텍스트 한 줄당 최대 글자 수 (초과 시 경고)
+QA_MAX_CHARS = 45
+# 유니코드 대체 문자 (인코딩 깨짐 표시)
+QA_REPLACEMENT_CHAR = "\uFFFD"
 
 
 # 언어 옵션: (코드, 표시명) — 1.영어 2.러시아어 3.한국어, 이하 사용량 순
@@ -235,6 +240,26 @@ MODEL_QUALITY: Dict[str, str] = {
 }
 
 
+def _glossary_dict_to_text(d: Dict[str, str]) -> str:
+    """용어집 딕셔너리를 '원본:번역' 한 줄씩 텍스트로 변환."""
+    return "\n".join(f"{k}:{v}" for k, v in (d or {}).items() if (k or "").strip())
+
+
+def _glossary_text_to_dict(text: str) -> Dict[str, str]:
+    """'원본:번역' 형식 텍스트를 딕셔너리로 파싱."""
+    result: Dict[str, str] = {}
+    for line in (text or "").strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if ":" in line:
+            k, _, v = line.partition(":")
+            key = k.strip()
+            if key:
+                result[key] = v.strip()
+    return result
+
+
 def _model_quality_for_id(model_id: str) -> str:
     """모델 ID에 해당하는 품질 등급 반환."""
     return MODEL_QUALITY.get(model_id, "-")
@@ -252,10 +277,23 @@ DEFAULT_FONT_PT = 11
 # 모델별 성능 데이터 영구 저장 경로
 MODEL_PERF_PATH = _base_dir / "model_performance.json"
 
+# 로그 창 글자 크기 기본값 (메인 프로그램과 별도)
+LOG_FONT_DEFAULT_LABEL = "작게"
+LOG_FONT_DEFAULT_PT = 10
+
+# 용어집 창 글자 크기·레이아웃 기본값
+GLOSSARY_FONT_DEFAULT_LABEL = "보통"
+GLOSSARY_FONT_DEFAULT_PT = 11
+GLOSSARY_WIN_DEFAULT_WIDTH = 600
+GLOSSARY_WIN_DEFAULT_HEIGHT = 420
+GLOSSARY_COL_ORIGINAL_DEFAULT = 200
+GLOSSARY_COL_TRANSLATED_DEFAULT = 280
+
 # 로그 창: 예외/경고 메시지 강조용 패턴 (이 패턴이 포함되면 주황색으로 표시)
 LOG_HIGHLIGHT_PATTERNS = (
     "빈 줄", "실패", "오류", "503", "중단", "불일치", "경고",
     "통신 오류", "보정", "일시 사용 불가", "데이터 없음", "한도",
+    "깨진 문자",  # QA: 인코딩 오류
 )
 
 
@@ -504,6 +542,60 @@ class LogViewer:
         except Exception:
             pass
 
+    def _load_log_font_size(self) -> str:
+        """로그 창 글자 크기 라벨 로드. 기본값: 작게(10pt)."""
+        try:
+            path = _log_viewer_prefs_path()
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    prefs = json.load(f)
+                label = prefs.get("log_font_size", LOG_FONT_DEFAULT_LABEL)
+                if label in FONT_LABELS:
+                    return label
+        except Exception:
+            pass
+        return LOG_FONT_DEFAULT_LABEL
+
+    def _save_log_font_size(self, label: str) -> None:
+        """로그 창 글자 크기 저장."""
+        try:
+            path = _log_viewer_prefs_path()
+            prefs: Dict[str, Any] = {}
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    prefs = json.load(f)
+            prefs["log_font_size"] = label
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(prefs, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _get_log_font_pt(self) -> int:
+        """현재 로그 창 글자 크기 콤보에서 선택된 pt 반환."""
+        if hasattr(self, "_log_font_combo") and self._log_font_combo.winfo_exists():
+            label = self._log_font_combo.get()
+        else:
+            label = self._load_log_font_size()
+        for name, pt in FONT_SIZE_OPTIONS:
+            if name == label:
+                return pt
+        return LOG_FONT_DEFAULT_PT
+
+    def _on_log_font_changed(self) -> None:
+        """로그 창 글자 크기 변경 시 텍스트 폰트 갱신 및 저장."""
+        label = (self._log_font_combo.get() or "").strip()
+        if label not in FONT_LABELS:
+            return
+        self._save_log_font_size(label)
+        self._update_log_font_size()
+
+    def _update_log_font_size(self) -> None:
+        """로그 창 텍스트 위젯 폰트 크기 즉시 적용."""
+        if self.text is None or not self.text.winfo_exists():
+            return
+        pt = self._get_log_font_pt()
+        self.text.config(font=("Consolas", pt))
+
     # ---- UI ----
 
     def _create_window(self) -> None:
@@ -517,13 +609,22 @@ class LogViewer:
         lw, lh = self.load_size()
         self.win.geometry(f"{lw}x{lh}")
         self.win.protocol("WM_DELETE_WINDOW", self._on_user_close)
-        # 상단 헤더: 크기 초기화 버튼
+        # 상단 헤더: 글자 크기 (좌측) + 크기 초기화 (우측)
         self._header_frame = ttk.Frame(self.win)
         self._header_frame.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(self._header_frame, text="글자 크기:").pack(side="left", padx=(0, 4))
+        self._log_font_combo = ttk.Combobox(
+            self._header_frame, values=FONT_LABELS, state="readonly", width=10
+        )
+        self._log_font_combo.pack(side="left", padx=(0, 12))
+        self._log_font_combo.bind("<<ComboboxSelected>>", lambda e: self._on_log_font_changed())
+        font_label = self._load_log_font_size()
+        self._log_font_combo.set(font_label if font_label in FONT_LABELS else LOG_FONT_DEFAULT_LABEL)
         ttk.Button(self._header_frame, text="크기 초기화", command=self._on_reset_size).pack(side="right")
         frame = ttk.Frame(self.win, padding=4)
         frame.pack(fill="both", expand=True)
-        self.text = ScrolledText(frame, wrap="word", font=("Consolas", 9), height=20, width=40)
+        log_pt = self._get_log_font_pt()
+        self.text = ScrolledText(frame, wrap="word", font=("Consolas", log_pt), height=20, width=40)
         self.text.pack(fill="both", expand=True)
         self.text.config(state="disabled")  # 편집 불가, append만
         self.text.tag_configure("log_highlight", foreground="#D35400")  # 예외/경고 메시지 강조 (주황)
@@ -686,6 +787,36 @@ def _map_translation_response_lines(
     return lines_final
 
 
+def _run_qa_checks(
+    batch_rows: List[Dict[str, Any]],
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> None:
+    """
+    AI 번역 결과 QA 검수: 글자 수 초과, 인코딩 깨짐(\\uFFFD) 감지.
+    발견 시 [경고]/[오류] 로그 출력 (기존 예외 로그와 동일하게 강조 색상 적용).
+    """
+    if not log_callback:
+        return
+
+    for row in batch_rows:
+        trans = (row.get("translated") or "").strip()
+        if trans == AI_TRANSLATE_EMPTY_PLACEHOLDER or not trans:
+            continue
+        idx = row.get("index", 0)
+        # 45자 초과 검증 (각 줄별)
+        for line in trans.replace("<br/>", "\n").split("\n"):
+            ln = line.strip()
+            if not ln:
+                continue
+            n = len(ln)
+            if n > QA_MAX_CHARS:
+                log_callback(f"[경고] Line {idx}: 번역된 텍스트가 45자를 초과했습니다. (길이: {n}자)")
+                break  # 행당 한 번만 로그
+        # 유니코드 대체 문자(깨진 문자) 감지
+        if QA_REPLACEMENT_CHAR in trans:
+            log_callback(f"[오류] Line {idx}: 번역 결과에 깨진 문자()가 감지되었습니다.")
+
+
 # --- UI 애플리케이션 ---------------------------------------------------------
 
 class SrtVerifierMergerApp:
@@ -711,8 +842,8 @@ class SrtVerifierMergerApp:
 
         # 마지막 AI 번역에 사용한 모델 (병합 시 파일명 네이밍에 사용)
         self._last_ai_model: Optional[str] = None
-        # 사용자 정의 용어집 (원본:번역 한 줄씩, settings.json에 저장)
-        self._glossary_text: str = ""
+        # 언어별 용어집 { "English": {"원본": "번역"}, ... } — glossary.json 저장
+        self._glossary_data: Dict[str, Dict[str, str]] = {}
 
         # 모두 번역(Translate All) 모드 상태
         self.translate_all_var = tk.BooleanVar(value=False)
@@ -1246,8 +1377,7 @@ class SrtVerifierMergerApp:
         self.ai_translate_btn.config(state="normal" if has_original else "disabled")
         self.translate_range_entry.config(state="normal" if has_original else "disabled")
         self.ai_model_combo.config(state="readonly" if has_original else "disabled")
-        self.ai_lang_combo.config(state="readonly" if has_original else "disabled")
-        self.glossary_btn.config(state="normal" if has_original else "disabled")
+        # ai_lang_combo(번역 언어): 상시 활성화 (원본 파일 로드 여부 무관)
 
     def _merge_and_refresh(self):
         """SRT 블록과 TXT 라인을 병합한 뒤 Treeview 갱신."""
@@ -1334,8 +1464,24 @@ class SrtVerifierMergerApp:
             self.ai_model_combo.set(display)
         else:
             self.ai_model_combo.set(AI_MODEL_AUTO)
-        # 사용자 정의 용어집
-        self._glossary_text = prefs.get("glossary", "") or ""
+        # 언어별 용어집 (glossary.json)
+        self._load_glossary_data()
+        # 메인 창 크기·위치
+        mw = prefs.get("main_win_width")
+        mh = prefs.get("main_win_height")
+        mx = prefs.get("main_win_x")
+        my = prefs.get("main_win_y")
+        if isinstance(mw, (int, float)) and isinstance(mh, (int, float)):
+            w, h = int(mw), int(mh)
+            if 800 <= w <= 4000 and 600 <= h <= 2000:
+                if isinstance(mx, (int, float)) and isinstance(my, (int, float)):
+                    x, y = int(mx), int(my)
+                    if -5000 <= x <= 5000 and -5000 <= y <= 5000:
+                        self.root.geometry(f"{w}x{h}+{x}+{y}")
+                    else:
+                        self.root.geometry(f"{w}x{h}")
+                else:
+                    self.root.geometry(f"{w}x{h}")
         # 작업 내용(로그 창) 표시 여부
         log_visible = prefs.get("log_viewer_visible", False)
         self._log_viewer_visible_var.set(log_visible)
@@ -1360,8 +1506,15 @@ class SrtVerifierMergerApp:
             prefs["font_size"] = self.font_size_combo.get()
             prefs["ai_lang"] = self.ai_lang_combo.get()
             prefs["ai_model"] = self._get_selected_model_id()
-            prefs["glossary"] = self._glossary_text
             prefs["log_viewer_visible"] = self._log_viewer_visible_var.get()
+            # 메인 창 크기·위치
+            try:
+                prefs["main_win_width"] = self.root.winfo_width()
+                prefs["main_win_height"] = self.root.winfo_height()
+                prefs["main_win_x"] = self.root.winfo_x()
+                prefs["main_win_y"] = self.root.winfo_y()
+            except (tk.TclError, Exception):
+                pass
             with open(PREFS_PATH, "w", encoding="utf-8") as f:
                 json.dump(prefs, f, ensure_ascii=False)
         except Exception:
@@ -1379,38 +1532,316 @@ class SrtVerifierMergerApp:
         """사용 중인 Gemini API 키 반환 (.env 등에서 로드)."""
         return load_gemini_api_key()
 
+    def _load_glossary_data(self) -> None:
+        """glossary.json에서 언어별 용어집 로드. 없으면 기존 settings.json glossary 마이그레이션 시도."""
+        self._glossary_data = {}
+        if GLOSSARY_PATH.exists():
+            try:
+                raw = json.loads(GLOSSARY_PATH.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    self._glossary_data = {
+                        k: (v if isinstance(v, dict) else {})
+                        for k, v in raw.items()
+                        if isinstance(k, str)
+                    }
+            except Exception:
+                pass
+        if not self._glossary_data:
+            # 마이그레이션: settings.json의 기존 glossary → 첫 번째 언어로 이전
+            try:
+                if PREFS_PATH.exists():
+                    prefs = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+                    old = (prefs.get("glossary") or "").strip()
+                    if old:
+                        d = _glossary_text_to_dict(old)
+                        if d:
+                            first_lang = LANG_DISPLAYS[0]
+                            self._glossary_data[first_lang] = d
+                            self._save_glossary_data()
+            except Exception:
+                pass
+
+    def _save_glossary_data(self) -> None:
+        """현재 _glossary_data를 glossary.json에 저장."""
+        try:
+            GLOSSARY_PATH.write_text(
+                json.dumps(self._glossary_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _get_glossary_text_for_lang(self, lang_display: str) -> str:
+        """선택된 타겟 언어에 해당하는 용어집을 프롬프트용 '원본:번역' 텍스트로 반환."""
+        d = self._glossary_data.get(lang_display or "", {}) or {}
+        return _glossary_dict_to_text(d)
+
+    def _load_glossary_font_size(self) -> str:
+        """용어집 창 글자 크기 라벨 로드."""
+        try:
+            if PREFS_PATH.exists():
+                prefs = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+                label = prefs.get("glossary_font_size", GLOSSARY_FONT_DEFAULT_LABEL)
+                if label in FONT_LABELS:
+                    return label
+        except Exception:
+            pass
+        return GLOSSARY_FONT_DEFAULT_LABEL
+
+    def _save_glossary_font_size(self, label: str) -> None:
+        """용어집 창 글자 크기 저장."""
+        try:
+            prefs: Dict[str, Any] = {}
+            if PREFS_PATH.exists():
+                prefs = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+            prefs["glossary_font_size"] = label
+            PREFS_PATH.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_glossary_layout(self) -> Tuple[int, int, int, int]:
+        """용어집 창 크기 및 컬럼 너비 로드."""
+        try:
+            if PREFS_PATH.exists():
+                prefs = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+                w = prefs.get("glossary_win_width", GLOSSARY_WIN_DEFAULT_WIDTH)
+                h = prefs.get("glossary_win_height", GLOSSARY_WIN_DEFAULT_HEIGHT)
+                c1 = prefs.get("glossary_col_original_width", GLOSSARY_COL_ORIGINAL_DEFAULT)
+                c2 = prefs.get("glossary_col_translated_width", GLOSSARY_COL_TRANSLATED_DEFAULT)
+                if all(isinstance(x, (int, float)) for x in (w, h, c1, c2)):
+                    w = max(400, min(int(w), 1600))
+                    h = max(300, min(int(h), 1200))
+                    c1 = max(80, min(int(c1), 600))
+                    c2 = max(80, min(int(c2), 800))
+                    return (w, h, c1, c2)
+        except Exception:
+            pass
+        return (
+            GLOSSARY_WIN_DEFAULT_WIDTH,
+            GLOSSARY_WIN_DEFAULT_HEIGHT,
+            GLOSSARY_COL_ORIGINAL_DEFAULT,
+            GLOSSARY_COL_TRANSLATED_DEFAULT,
+        )
+
+    def _save_glossary_layout(self, win: tk.Toplevel, tree: ttk.Treeview) -> None:
+        """용어집 창 크기·컬럼 너비·글자 크기 일괄 저장."""
+        try:
+            prefs: Dict[str, Any] = {}
+            if PREFS_PATH.exists():
+                prefs = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+            if win and win.winfo_exists():
+                prefs["glossary_win_width"] = win.winfo_width()
+                prefs["glossary_win_height"] = win.winfo_height()
+            if tree and tree.winfo_exists():
+                try:
+                    w1 = tree.column("original", "width")
+                    w2 = tree.column("translated", "width")
+                    prefs["glossary_col_original_width"] = int(w1) if w1 is not None else GLOSSARY_COL_ORIGINAL_DEFAULT
+                    prefs["glossary_col_translated_width"] = int(w2) if w2 is not None else GLOSSARY_COL_TRANSLATED_DEFAULT
+                except (tk.TclError, TypeError, ValueError):
+                    pass
+            PREFS_PATH.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     def _on_glossary_settings(self) -> None:
-        """용어집 설정 팝업: 원본:번역 형식 입력, 저장 시 settings.json에 유지."""
+        """용어집 설정 팝업: 독립 언어 선택 + 2열 Treeview + 글자 크기 + 추가/수정/삭제."""
+        # 초기: 메인 프로그램 선택 언어로 동기화
+        init_lang = (self.ai_lang_combo.get() or "").strip() or LANG_DISPLAYS[0]
+        win_w, win_h, col_orig, col_trans = self._load_glossary_layout()
+
         win = tk.Toplevel(self.root)
-        win.title("사용자 정의 용어집 (Custom Glossary)")
+        win.title("용어집 설정")
         win.transient(self.root)
         win.grab_set()
-        win.geometry("520x320")
-        ttk.Label(
-            win,
-            text="원본단어:번역단어 형식으로 한 줄에 하나씩 입력 (예: Stark:스타크, Winterfell:윈터펠)",
-            font=("", 9),
-        ).pack(anchor="w", padx=10, pady=(10, 4))
-        frame = ttk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=10, pady=4)
-        text_scroll = ttk.Scrollbar(frame)
-        text_scroll.pack(side="right", fill="y")
-        text_widget = tk.Text(frame, wrap="word", height=12, width=60, yscrollcommand=text_scroll.set, font=("Consolas", 10))
-        text_widget.pack(side="left", fill="both", expand=True)
-        text_scroll.config(command=text_widget.yview)
-        text_widget.insert("1.0", self._glossary_text)
-        text_widget.focus_set()
+        win.minsize(450, 380)
+        win.geometry(f"{win_w}x{win_h}")
+
+        def get_glossary_lang() -> str:
+            return (lang_combo_glossary.get() or "").strip() or LANG_DISPLAYS[0]
+
+        current_glossary_lang = [init_lang]  # mutable로 현재 편집 중 언어 추적
+
+        # 하단 프레임: 항상 고정 (pack side=bottom 먼저)
+        bottom_frame = ttk.LabelFrame(win, text="단어 추가/수정/삭제")
+        bottom_frame.pack(side="bottom", fill="x", padx=10, pady=(4, 10))
+        bottom_frame.columnconfigure(1, weight=1)
+        bottom_frame.columnconfigure(3, weight=1)
+        ttk.Label(bottom_frame, text="원본:").grid(row=0, column=0, padx=(8, 4), pady=6, sticky="w")
+        orig_var = tk.StringVar()
+        orig_entry = tk.Entry(
+            bottom_frame, textvariable=orig_var, width=20,
+            font=("맑은 고딕", 11),
+        )
+        orig_entry.grid(row=0, column=1, padx=(0, 12), pady=6, ipady=3, sticky="ew")
+        ttk.Label(bottom_frame, text="번역:").grid(row=0, column=2, padx=(12, 4), pady=6, sticky="w")
+        trans_var = tk.StringVar()
+        trans_entry = tk.Entry(
+            bottom_frame, textvariable=trans_var, width=20,
+            font=("맑은 고딕", 11),
+        )
+        trans_entry.grid(row=0, column=3, padx=(0, 8), pady=6, ipady=3, sticky="ew")
+        btn_row = ttk.Frame(bottom_frame)
+        btn_row.grid(row=1, column=0, columnspan=4, pady=(0, 6))
+
+        # 상단: 언어 선택(독립) + 글자 크기
+        top_frame = ttk.Frame(win)
+        top_frame.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(top_frame, text="언어:").pack(side="left", padx=(0, 4))
+        lang_combo_glossary = ttk.Combobox(top_frame, values=LANG_DISPLAYS, state="readonly", width=12)
+        lang_combo_glossary.pack(side="left", padx=(0, 16))
+        lang_combo_glossary.set(init_lang if init_lang in LANG_DISPLAYS else LANG_DISPLAYS[0])
+        ttk.Label(top_frame, text="글자 크기:").pack(side="left", padx=(0, 4))
+        font_combo = ttk.Combobox(top_frame, values=FONT_LABELS, state="readonly", width=10)
+        font_combo.pack(side="left", padx=(0, 12))
+        font_label = self._load_glossary_font_size()
+        font_combo.set(font_label if font_label in FONT_LABELS else GLOSSARY_FONT_DEFAULT_LABEL)
+
+        def get_font_pt() -> int:
+            lb = font_combo.get()
+            for name, pt in FONT_SIZE_OPTIONS:
+                if name == lb:
+                    return pt
+            return GLOSSARY_FONT_DEFAULT_PT
+
+        def on_font_changed() -> None:
+            pt = get_font_pt()
+            style = ttk.Style()
+            style.configure("Glossary.Treeview", font=("Segoe UI", pt), rowheight=FONT_ROWHEIGHT.get(pt, 28))
+            style.configure("Glossary.Treeview.Heading", font=("Segoe UI", pt, "bold"))
+            self._save_glossary_font_size(font_combo.get())
+
+        font_combo.bind("<<ComboboxSelected>>", lambda e: on_font_changed())
+
+        # Treeview 2열 (상단·중간 영역, expand로 남은 공간 채움)
+        trans_col = f"번역단어({get_glossary_lang()})"
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        scroll = ttk.Scrollbar(tree_frame)
+        tree = ttk.Treeview(
+            tree_frame,
+            columns=("original", "translated"),
+            show="headings",
+            height=12,
+            yscrollcommand=scroll.set,
+            selectmode="browse",
+            style="Glossary.Treeview",
+        )
+        tree.heading("original", text="원본단어")
+        tree.heading("translated", text=trans_col)
+        tree.column("original", width=col_orig, minwidth=80)
+        tree.column("translated", width=col_trans, minwidth=80)
+        scroll.config(command=tree.yview)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        style = ttk.Style()
+        pt = get_font_pt()
+        style.configure("Glossary.Treeview", font=("Segoe UI", pt), rowheight=FONT_ROWHEIGHT.get(pt, 28))
+        style.configure("Glossary.Treeview.Heading", font=("Segoe UI", pt, "bold"))
+        tree.tag_configure("odd", background="#f5f5f5")
+        tree.tag_configure("even", background="#ffffff")
+
+        def load_glossary_for_lang(lang: str) -> None:
+            """선택된 언어의 용어집 데이터를 표에 로드. 헤더·데이터 갱신."""
+            d = dict(self._glossary_data.get(lang, {}) or {})
+            tree.heading("translated", text=f"번역단어({lang})")
+            for item in tree.get_children():
+                tree.delete(item)
+            for i, (orig, trans) in enumerate(sorted(d.items())):
+                tag = "even" if i % 2 == 0 else "odd"
+                tree.insert("", "end", values=(orig, trans or ""), tags=(tag,))
+
+        def on_glossary_lang_changed() -> None:
+            """용어집 창 언어 변경: 현재 표 데이터 저장 후 새 언어 로드. 메인 창은 변경 없음."""
+            self._glossary_data[current_glossary_lang[0]] = tree_to_dict()
+            new_lang = get_glossary_lang()
+            current_glossary_lang[0] = new_lang
+            load_glossary_for_lang(new_lang)
+            orig_var.set("")
+            trans_var.set("")
+
+        lang_combo_glossary.bind("<<ComboboxSelected>>", lambda e: on_glossary_lang_changed())
+
+        lang_dict = dict(self._glossary_data.get(get_glossary_lang(), {}) or {})
+        for i, (orig, trans) in enumerate(sorted(lang_dict.items())):
+            tag = "even" if i % 2 == 0 else "odd"
+            tree.insert("", "end", values=(orig, trans or ""), tags=(tag,))
+
+        def tree_to_dict() -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            for item in tree.get_children():
+                v = tree.item(item, "values")
+                if v and len(v) >= 2 and (v[0] or "").strip():
+                    out[(v[0] or "").strip()] = (v[1] or "").strip()
+            return out
+
+        def refresh_tree() -> None:
+            for item in tree.get_children():
+                tree.delete(item)
+            d = tree_to_dict()
+            for i, (orig, trans) in enumerate(sorted(d.items())):
+                tag = "even" if i % 2 == 0 else "odd"
+                tree.insert("", "end", values=(orig, trans or ""), tags=(tag,))
+
+        def on_select(event: tk.Event) -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            item = tree.item(sel[0], "values")
+            if item and len(item) >= 2:
+                orig_var.set(item[0] or "")
+                trans_var.set(item[1] or "")
+
+        def _rebuild_tree_from_dict(d: Dict[str, str]) -> None:
+            for item in tree.get_children():
+                tree.delete(item)
+            for i, (orig, trans) in enumerate(sorted(d.items())):
+                tag = "even" if i % 2 == 0 else "odd"
+                tree.insert("", "end", values=(orig, trans or ""), tags=(tag,))
+
+        def add_or_update() -> None:
+            o = (orig_var.get() or "").strip()
+            if not o:
+                return
+            t = (trans_var.get() or "").strip()
+            d = tree_to_dict()
+            d[o] = t
+            _rebuild_tree_from_dict(d)
+            orig_var.set("")
+            trans_var.set("")
+            orig_entry.focus_set()
+
+        def delete_selected() -> None:
+            o = (orig_var.get() or "").strip()
+            if not o:
+                sel = tree.selection()
+                if sel:
+                    vals = tree.item(sel[0], "values")
+                    o = (vals[0] or "").strip() if vals else ""
+            if o:
+                d = tree_to_dict()
+                d.pop(o, None)
+                _rebuild_tree_from_dict(d)
+                orig_var.set("")
+                trans_var.set("")
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        orig_entry.bind("<Return>", lambda e: trans_entry.focus_set())
+        trans_entry.bind("<Return>", lambda e: add_or_update())
 
         def save_and_close() -> None:
-            self._glossary_text = text_widget.get("1.0", tk.END).strip()
+            self._glossary_data[current_glossary_lang[0]] = tree_to_dict()
+            self._save_glossary_data()
+            self._save_glossary_layout(win, tree)
             self._save_preferences()
             win.destroy()
 
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(pady=(8, 10))
-        ttk.Button(btn_frame, text="저장", command=save_and_close).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="닫기", command=save_and_close).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="추가/수정", command=add_or_update).pack(side="left", padx=(0, 4))
+        ttk.Button(btn_row, text="삭제", command=delete_selected).pack(side="left", padx=(0, 4))
+        ttk.Button(btn_row, text="저장 후 닫기", command=save_and_close).pack(side="right", padx=4)
         win.protocol("WM_DELETE_WINDOW", save_and_close)
+        orig_entry.focus_set()
 
     def _on_translate_range_focus_in(self, event: tk.Event) -> None:
         if self._translate_range_placeholder_active:
@@ -1990,6 +2421,8 @@ class SrtVerifierMergerApp:
                     end_1 = batch_rows[-1].get("index", batch_indices[-1] + 1)
                     msg = f"Line {start_1}-{end_1}: 빈 줄 {empty_count}건 감지되어 <빈줄> 처리"
                     self.root.after(0, lambda m=msg: self._append_log(m))
+                # QA 검수: 글자 수 초과, 인코딩 깨짐 (예외 로그와 동일 강조)
+                _run_qa_checks(batch_rows, log_cb)
                 # 모두 번역 모드: 진행률 갱신 + 그리드 즉시 갱신
                 if self._translate_all_mode_active:
                     if num_batches > 0:
@@ -2073,7 +2506,7 @@ class SrtVerifierMergerApp:
         num_batches = (total + batch_size - 1) // batch_size
         selected_model = self._get_selected_model_id()
         use_auto = not selected_model or selected_model == AI_MODEL_AUTO
-        glossary_text = self._glossary_text or ""
+        glossary_text = self._get_glossary_text_for_lang(target_lang)
 
         self.status_var.set("AI 번역 중...")
         self.ai_translate_btn.config(state="disabled")
