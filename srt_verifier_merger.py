@@ -6,6 +6,7 @@ Python 3 + tkinter / ttk 단일 파일 실행
 
 import json
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -40,8 +41,9 @@ README_PATH = _base_dir / "readme.txt"
 # Gemini API 키를 읽을 .env 후보 (배포 exe에서는 exe 폴더만 사용, 개발 시에만 GEMINI_ENV_PATH 추가)
 GEMINI_ENV_PATH = Path(r"C:\cursor2\ai-chatbot-app\ai-chatbot\.env.local")
 
-# 프로그램 아이콘 PNG (스크립트 기준 경로)
-_ICON_CANDIDATES = ("icon.png", "Gemini_Generated_Image_28x0ow28x0ow28x0.png")
+# 프로그램 아이콘 (스크립트 기준 경로)
+_ICON_ICO_CANDIDATES = ("app.ico", "icon.ico")  # Windows 작업 표시줄·제목 표시줄 등
+_ICON_PNG_CANDIDATES = ("icon.png", "Gemini_Generated_Image_28x0ow28x0ow28x0.png")
 
 
 # 메뉴얼: 간단(툴팁용) / 자세한(상세 창용)
@@ -179,8 +181,10 @@ MAX_LOG_LIMIT = 500
 PRUNE_COUNT = 100
 LOG_HISTORY_PATH = _base_dir / "log_history.json"
 
-# AI 번역 배치 크기 (한 번에 API에 보낼 줄 수). 크게 하면 요청 횟수 감소 → 무료 한도(일 20회) 절약
-AI_TRANSLATE_BATCH_SIZE = 50
+# AI 번역 배치 크기 (한 번에 API에 보낼 최대 블록 수). 10줄 단위 청크로 순번 동기화 강제
+BATCH_CHUNK_SIZE = 10
+# 구간 번역 시에도 동일한 청크 크기 사용 (레거시 호환용 이름 유지)
+AI_TRANSLATE_BATCH_SIZE = BATCH_CHUNK_SIZE
 # 번역 구간 지정 시 한 번에 최대 개수
 AI_TRANSLATE_RANGE_MAX = 50
 # 번역 범위 입력 placeholder
@@ -444,14 +448,21 @@ class LogViewer:
     LOG_DEFAULT_WIDTH = 480
     LOG_DEFAULT_HEIGHT = 400
 
-    def __init__(self, parent: tk.Tk, on_user_close_callback: Optional[Callable[[], None]] = None):
+    def __init__(
+        self,
+        parent: tk.Tk,
+        on_user_close_callback: Optional[Callable[[], None]] = None,
+        on_window_create: Optional[Callable[[tk.Toplevel], None]] = None,
+    ):
         self.parent = parent
         self.on_user_close = on_user_close_callback
+        self.on_window_create = on_window_create
         self.win: Optional[tk.Toplevel] = None
         self.text: Optional[ScrolledText] = None
         self._active = True  # False 시 Configure 콜백 무시
-        self._entries: List[Dict[str, str]] = []  # {"ts": "...", "msg": "..."}
+        self._entries: List[Dict[str, Any]] = []  # {"ts": "...", "msg": "..."}
         self._header_frame: Optional[ttk.Frame] = None
+        # (인라인 이어붙이기 제거됨 — 45자 초과 경고도 한 줄씩 독립 출력)
         self._load_history()
 
     # ---- 영구 저장 / 로드 ----
@@ -500,7 +511,6 @@ class LogViewer:
             else:
                 self.text.insert("end", line)
         self.text.see("end")
-        self.text.config(state="disabled")
 
     # ---- 크기 저장 / 로드 ----
 
@@ -603,6 +613,8 @@ class LogViewer:
         if self.win is not None and self.win.winfo_exists():
             return
         self.win = tk.Toplevel(self.parent)
+        if self.on_window_create:
+            self.on_window_create(self.win)
         self.win.title("SubBridge — 로그")
         self.win.resizable(True, True)
         self.win.minsize(200, 150)
@@ -626,7 +638,9 @@ class LogViewer:
         log_pt = self._get_log_font_pt()
         self.text = ScrolledText(frame, wrap="word", font=("Consolas", log_pt), height=20, width=40)
         self.text.pack(fill="both", expand=True)
-        self.text.config(state="disabled")  # 편집 불가, append만
+        # state=normal로 두어 클릭 이벤트 수신 (disabled 시 Button-1 미수신). Key는 무시로 편집 방지
+        self.text.config(state="normal")
+        self.text.bind("<Key>", lambda e: "break")
         self.text.tag_configure("log_highlight", foreground="#D35400")  # 예외/경고 메시지 강조 (주황)
         # 저장된 이전 로그를 텍스트 위젯에 복원
         self._rebuild_text_widget()
@@ -703,35 +717,33 @@ class LogViewer:
             except tk.TclError:
                 pass
 
-    def append(self, message: str) -> None:
-        """로그 메시지 추가 (타임스탬프 자동, 영구 저장, 자동 정리)."""
+    def append(self, message: str, log_type: Optional[str] = None) -> None:
+        """로그 메시지 추가 (타임스탬프 자동, 영구 저장, 자동 정리, 실시간 UI 갱신)."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        is_length_warning = log_type == "length_warning"
+        if is_length_warning:
+            message = f"[경고] {message}"
         entry = {"ts": ts, "msg": message}
-        # 리스트에 추가
         self._entries.append(entry)
-        # UI에 추가 (텍스트 위젯이 있으면)
         if self.text is not None and self.text.winfo_exists():
             line = f"[{ts}] {message}\n"
             self.text.config(state="normal")
-            if self._is_highlight_msg(message):
+            if self._is_highlight_msg(message) or is_length_warning:
                 self.text.insert("end", line, "log_highlight")
             else:
                 self.text.insert("end", line)
             self.text.see("end")
-            self.text.config(state="disabled")
-        # 개수 초과 체크 → 자동 정리
+            self.text.update_idletasks()
         self._prune_if_needed()
-        # 파일 저장
         self._save_history()
+
 
     def clear(self) -> None:
         """로그 내용 초기화 (리스트·파일·UI)."""
         self._entries.clear()
         self._save_history()
         if self.text is not None and self.text.winfo_exists():
-            self.text.config(state="normal")
             self.text.delete("1.0", "end")
-            self.text.config(state="disabled")
 
     def destroy(self) -> None:
         """로그 창 종료. 종료 전 크기 저장."""
@@ -787,17 +799,83 @@ def _map_translation_response_lines(
     return lines_final
 
 
+def _parse_json_translation_response(raw: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    AI 응답에서 JSON 배열 추출. ```json ... ``` 래퍼 제거 후 json.loads.
+    성공 시 [{"id": "1", "text": "..."}, ...] 형태 리스트 반환, 실패 시 None.
+    """
+    if not (raw or "").strip():
+        return None
+    text = raw.strip()
+    # 마크다운 코드 블록 제거
+    if text.startswith("```"):
+        lines = text.split("\n")
+        out = []
+        in_block = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                in_block = not in_block
+                if in_block and "json" in line.lower():
+                    continue
+                if not in_block:
+                    continue
+            if in_block:
+                out.append(line)
+        text = "\n".join(out)
+    try:
+        data = json.loads(text)
+        if not isinstance(data, list):
+            return None
+        return data
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _translate_chunk_single_fallback(
+    client: Any,
+    config: Any,
+    model_name: str,
+    batch_rows: List[Dict[str, Any]],
+    target_lang: str,
+    system_instruction: Any = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    배치 JSON 실패 시 해당 청크만 1줄씩 개별 번역. batch_rows를 직접 수정.
+    성공 시 (True, None), API 오류(429/503 등) 시 (False, err_msg) 반환.
+    """
+    for row in batch_rows:
+        orig = (row.get("original") or "").replace("\r\n", "<br/>").replace("\n", "<br/>").strip()
+        prompt = (
+            f"아래 문장을 **{target_lang}**로 번역해 주세요. `<br/>`는 그대로 두고, 번역 결과 한 줄만 출력.\n\n{orig}"
+        )
+        try:
+            response = client.models.generate_content(
+                model=model_name, contents=prompt, config=config
+            )
+            text = (response.text or "").strip()
+            line = text.split("\n")[0].strip() if text else ""
+            row["translated"] = line if line else AI_TRANSLATE_EMPTY_PLACEHOLDER
+        except Exception as e:
+            err_msg = str(e)
+            if "429" in err_msg or "Resource Exhausted" in err_msg or "quota" in err_msg.lower() or "exceeded" in err_msg.lower():
+                return (False, "API 사용량이 초과되었습니다. 잠시 후 다시 시도하거나 API 키를 확인해주세요. (429)")
+            if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                return (False, f"503_UNAVAILABLE|{model_name}")
+            row["translated"] = "[통신 오류]"
+            return (False, f"통신 오류: {err_msg}")
+    return (True, None)
+
+
 def _run_qa_checks(
     batch_rows: List[Dict[str, Any]],
     log_callback: Optional[Callable[[str], None]] = None,
+    overflow_callback: Optional[Callable[[str], None]] = None,
 ) -> None:
     """
     AI 번역 결과 QA 검수: 글자 수 초과, 인코딩 깨짐(\\uFFFD) 감지.
-    발견 시 [경고]/[오류] 로그 출력 (기존 예외 로그와 동일하게 강조 색상 적용).
+    overflow_callback: 45자 초과 경고 전용 콜백 (인라인 연속 출력용). 없으면 log_callback 사용.
     """
-    if not log_callback:
-        return
-
     for row in batch_rows:
         trans = (row.get("translated") or "").strip()
         if trans == AI_TRANSLATE_EMPTY_PLACEHOLDER or not trans:
@@ -810,10 +888,14 @@ def _run_qa_checks(
                 continue
             n = len(ln)
             if n > QA_MAX_CHARS:
-                log_callback(f"[경고] Line {idx}: 번역된 텍스트가 45자를 초과했습니다. (길이: {n}자)")
+                msg = f"Line {idx} 45자 초과.(길이:{n}자)"
+                if overflow_callback:
+                    overflow_callback(msg)
+                elif log_callback:
+                    log_callback(msg)
                 break  # 행당 한 번만 로그
-        # 유니코드 대체 문자(깨진 문자) 감지
-        if QA_REPLACEMENT_CHAR in trans:
+        # 유니코드 대체 문자(깨진 문자) 감지 — 즉시 출력
+        if QA_REPLACEMENT_CHAR in trans and log_callback:
             log_callback(f"[오류] Line {idx}: 번역 결과에 깨진 문자()가 감지되었습니다.")
 
 
@@ -860,6 +942,8 @@ class SrtVerifierMergerApp:
         self._stats_manager = StatsManager()  # 모델별 누적 성능 데이터
         self._translation_start_time: float = 0.0  # 번역 시작 시각 (time.time())
         self._icon_photo: Optional[Any] = None  # 창 아이콘 참조 유지
+        self._icon_ico_path: Optional[str] = None  # app.ico 경로 (하위 창에 적용용)
+        # (45자 초과 경고는 실시간 출력으로 변경됨 — 수집 리스트 불필요)
         write_readme()  # 실행 시 readme.txt 생성(간단·세부 메뉴얼 기록, 실행 없이 읽기용)
         self._build_ui()
         self._setup_styles()
@@ -898,6 +982,7 @@ class SrtVerifierMergerApp:
             self._log_viewer = LogViewer(
                 self.root,
                 on_user_close_callback=lambda: self._log_viewer_visible_var.set(False),
+                on_window_create=self._apply_icon_to_toplevel,
             )
         self._log_viewer_visible_var.set(True)
         self._log_viewer.show()
@@ -912,14 +997,35 @@ class SrtVerifierMergerApp:
                 self._log_viewer.hide()
         self._save_preferences()
 
+    def _append_length_warning_log(self, message: str) -> None:
+        """45자 초과 경고 실시간 출력 (인라인 연속 출력 방식). 메인 스레드에서만 호출."""
+        lv = self._ensure_log_viewer()
+        lv.append(message, log_type="length_warning")
+
     def _append_log(self, message: str) -> None:
         """로그 메시지 추가 (메인 스레드에서만 호출). 로그 창이 없으면 생성."""
         lv = self._ensure_log_viewer()
         lv.append(message)
 
     def _set_window_icon(self):
-        """PNG 파일을 창 아이콘으로 설정 (Pillow 사용, 없으면 tk.PhotoImage 시도)."""
-        def try_load(path: Path) -> bool:
+        """app.ico 우선 적용 → 작업 표시줄·제목 표시줄·하위 창 모두 동일 아이콘."""
+        base = Path(getattr(sys, "_MEIPASS", _base_dir)) if getattr(sys, "frozen", False) else _base_dir
+
+        def try_ico(path: Path) -> bool:
+            if not path.exists():
+                return False
+            try:
+                self.root.iconbitmap(str(path))
+                self._icon_ico_path = str(path)
+                if _HAS_PIL:
+                    img = Image.open(path)
+                    self._icon_photo = ImageTk.PhotoImage(img)
+                    self.root.iconphoto(True, self._icon_photo)
+                return True
+            except Exception:
+                return False
+
+        def try_png(path: Path) -> bool:
             if not path.exists():
                 return False
             if _HAS_PIL:
@@ -927,6 +1033,11 @@ class SrtVerifierMergerApp:
                     img = Image.open(path)
                     self._icon_photo = ImageTk.PhotoImage(img)
                     self.root.iconphoto(True, self._icon_photo)
+                    if sys.platform == "win32":
+                        ico_path = Path(tempfile.gettempdir()) / ".subbridge_taskbar.ico"
+                        img.save(ico_path, format="ICO", sizes=[(256, 256), (48, 48), (32, 32), (16, 16)])
+                        self.root.iconbitmap(str(ico_path))
+                        self._icon_ico_path = str(ico_path)
                     return True
                 except Exception:
                     pass
@@ -938,13 +1049,27 @@ class SrtVerifierMergerApp:
                 pass
             return False
 
-        base = Path(getattr(sys, "_MEIPASS", _base_dir)) if getattr(sys, "frozen", False) else _base_dir
-        for name in _ICON_CANDIDATES:
-            if try_load(base / name):
-                return
-        for name in _ICON_CANDIDATES:
-            if try_load(_base_dir / name):
-                return
+        for ico_name in _ICON_ICO_CANDIDATES:
+            for d in (base, _base_dir):
+                if try_ico(d / ico_name):
+                    return
+        for png_name in _ICON_PNG_CANDIDATES:
+            for d in (base, _base_dir):
+                if try_png(d / png_name):
+                    return
+
+    def _apply_icon_to_toplevel(self, win: tk.Toplevel) -> None:
+        """하위 창(Toplevel)에 app.ico 적용 — 작업 표시줄·제목 표시줄 표시 통일."""
+        if self._icon_ico_path and sys.platform == "win32":
+            try:
+                win.iconbitmap(self._icon_ico_path)
+            except Exception:
+                pass
+        if self._icon_photo:
+            try:
+                win.iconphoto(True, self._icon_photo)
+            except Exception:
+                pass
 
     def _setup_styles(self):
         style = ttk.Style()
@@ -954,6 +1079,9 @@ class SrtVerifierMergerApp:
         style.map("Treeview", background=[("selected", "#0078d4")])
         self.tree.tag_configure("odd", background="#f5f5f5")
         self.tree.tag_configure("even", background="#ffffff")
+        # 45자 초과 또는 "빈줄" 포함 시 주황색 강조
+        self.tree.tag_configure("warning_odd", background="#f5f5f5", foreground="#D35400")
+        self.tree.tag_configure("warning_even", background="#ffffff", foreground="#D35400")
 
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=8)
@@ -1207,6 +1335,7 @@ class SrtVerifierMergerApp:
             self._help_tooltip_id = None
         self._destroy_tooltip()
         win = tk.Toplevel(self.root)
+        self._apply_icon_to_toplevel(win)
         win.title("자세한 메뉴얼")
         win.minsize(420, 360)
         win.geometry("500x480")
@@ -1283,6 +1412,15 @@ class SrtVerifierMergerApp:
         if iid and row_index is not None and 0 <= row_index < len(self.rows):
             self.tree.set(iid, "translated", value)
             self.rows[row_index]["translated"] = value
+            # 편집 후 45자 초과 / "빈줄" 여부에 따라 주황색 강조 갱신
+            stripe = "even" if row_index % 2 == 0 else "odd"
+            needs_warning = any(
+                len(ln.strip()) > QA_MAX_CHARS
+                for ln in value.replace("<br/>", "\n").split("\n")
+                if ln.strip()
+            ) or ("빈줄" in value)
+            tag = f"warning_{stripe}" if needs_warning else stripe
+            self.tree.item(iid, tags=(tag,))
             self._update_merge_button_state()
 
     def _cancel_inplace_edit(self) -> None:
@@ -1302,7 +1440,15 @@ class SrtVerifierMergerApp:
         # 행 간격 한 줄 기준, 현재 글자 크기에 맞는 행 높이 유지
         ttk.Style().configure("Treeview", rowheight=self._get_viewer_rowheight())
         for i, row in enumerate(self.rows):
-            tag = "even" if i % 2 == 0 else "odd"
+            stripe = "even" if i % 2 == 0 else "odd"
+            trans = row.get("translated", "") or ""
+            # 45자 초과 또는 "빈줄" 포함 시 주황색 강조
+            needs_warning = any(
+                len(ln.strip()) > QA_MAX_CHARS
+                for ln in trans.replace("<br/>", "\n").split("\n")
+                if ln.strip()
+            ) or ("빈줄" in trans)
+            tag = f"warning_{stripe}" if needs_warning else stripe
             self.tree.insert(
                 "",
                 "end",
@@ -1310,7 +1456,7 @@ class SrtVerifierMergerApp:
                 values=(
                     f'{row["index"]} ({row["timecode"]})',
                     row.get("original", ""),
-                    row.get("translated", ""),
+                    trans,
                 ),
                 tags=(tag,),
             )
@@ -1651,6 +1797,7 @@ class SrtVerifierMergerApp:
         win_w, win_h, col_orig, col_trans = self._load_glossary_layout()
 
         win = tk.Toplevel(self.root)
+        self._apply_icon_to_toplevel(win)
         win.title("용어집 설정")
         win.transient(self.root)
         win.grab_set()
@@ -2136,6 +2283,7 @@ class SrtVerifierMergerApp:
                 pass
 
         win = tk.Toplevel(self.root)
+        self._apply_icon_to_toplevel(win)
         win.title("모두 번역 진행 중")
         win.resizable(False, False)
         win.transient(self.root)
@@ -2206,6 +2354,7 @@ class SrtVerifierMergerApp:
             per_line = (elapsed / total) if (elapsed > 0 and total > 0) else 0
             speed_info = f", {elapsed:.1f}s, {per_line:.2f}s/ea" if elapsed > 0 else ""
             self.status_var.set(f"AI 번역 완료. (모델: {model_label}, 총 {total}줄{speed_info})")
+            # (45자 초과 경고는 실시간 출력 완료 — 별도 flush 불필요)
             # 누적 성능 데이터 저장 후 로그 출력 (역대 평균 계산용)
             if chosen_name and elapsed > 0 and total > 0:
                 self._stats_manager.accumulate(chosen_name, elapsed, total)
@@ -2368,51 +2517,80 @@ class SrtVerifierMergerApp:
                 batch_end = min(batch_start + batch_size, total)
                 batch_indices = indices[batch_start:batch_end]
                 batch_rows = [self.rows[i] for i in batch_indices]
-                # 한 행당 한 줄로 맞춤: original 내 줄바꿈을 <br/>로 치환해 전송 줄 수 = 행 수가 되도록 함
-                originals = [
-                    (r.get("original", "") or "").replace("\r\n", "<br/>").replace("\n", "<br/>").strip()
-                    for r in batch_rows
-                ]
-                block = "\n".join(originals)
-                n_lines = len(batch_rows)
-                user_prompt = (
-                    "【중요】 원본 텍스트의 `<br/>`는 **문자 그대로 인식**하고, 번역 내용에 **동일하게 반영**해야 한다. "
-                    "`<br/>`를 줄바꿈(\\n)으로 바꾸거나 삭제하거나 번역하지 말 것.\n\n"
-                    "【Few-shot 예시】 원본에 `<br/>`가 있으면 번역문에도 같은 위치에 `<br/>`를 그대로 포함.\n\n"
-                    "User: \"Hello<br/>World\"\n"
-                    "Model: \"안녕하세요<br/>세상\"\n\n"
-                    "User: \"This is a test.<br/>Do not break this.\"\n"
-                    "Model: \"이것은 테스트입니다.<br/>이것을 깨뜨리지 마세요.\"\n\n"
-                    "【출력 형식】 입력 1줄 = 출력 1줄. 원본 줄에 `<br/>`가 있으면 그 줄의 번역 결과에도 **반드시 `<br/>`를 문자 그대로** 한 줄 안에 포함. "
-                    "`<br/>`를 \\n으로 나누지 말 것.\n\n"
-                    "---\n\n"
-                    f"아래 텍스트는 정확히 {n_lines}줄이다. {target_lang}로 번역한 뒤, 정확히 {n_lines}줄만 출력. "
-                    "각 줄에서 `<br/>`는 번역문에 그대로 복사할 것. 한 줄에 한 문장씩, 빈 줄 없이 번역 결과만 출력.\n\n"
-                    f"{block}"
-                )
-                try:
-                    response = client.models.generate_content(
-                        model=chosen_name, contents=user_prompt, config=config
-                    )
-                    text = (response.text or "").strip()
-                    response_lines = [ln.strip() for ln in text.split("\n")]
-                except Exception as e:
-                    err_msg = str(e)
-                    if "429" in err_msg or "Resource Exhausted" in err_msg or "quota" in err_msg.lower() or "exceeded" in err_msg.lower():
-                        return (False, "API 사용량이 초과되었습니다. 잠시 후 다시 시도하거나 API 키를 확인해주세요. (429)", None)
-                    if "503" in err_msg or "UNAVAILABLE" in err_msg:
-                        return (False, f"503_UNAVAILABLE|{chosen_name}", None)
-                    for row in batch_rows:
-                        row["translated"] = "[통신 오류]"
-                    return (False, f"통신 오류: {err_msg}", None)
-                requested_len = len(batch_rows)
                 log_cb = lambda m: self.root.after(0, lambda msg=m: self._append_log(msg))
-                lines_final = _map_translation_response_lines(
-                    response_lines, batch_rows, requested_len, log_callback=log_cb
+                # JSON 입출력 배치 번역: id 유지로 순번 강제
+                input_arr = [
+                    {"id": str(r.get("index", i + 1)), "text": (r.get("original", "") or "").replace("\r\n", "<br/>").replace("\n", "<br/>").strip()}
+                    for i, r in enumerate(batch_rows)
+                ]
+                user_prompt = (
+                    "【필수】 아래는 자막 블록 배열(JSON)이다. 각 항목의 `id`는 순번이므로 **절대 변경·누락·추가하지 마라**. "
+                    "각 `text`를 **" + target_lang + "**로 번역한 뒤, **입력과 동일한 id**를 유지하여 아래 형식의 **유효한 JSON 배열만** 출력하라. "
+                    "부연 설명·코드 블록 설명·마크다운은 절대 금지. `<br/>`는 번역문에 문자 그대로 포함.\n\n"
+                    "입력:\n" + json.dumps(input_arr, ensure_ascii=False) + "\n\n"
+                    "출력 형식(이 형식의 JSON 배열만 출력): [{\"id\": \"1\", \"text\": \"번역문\"}, {\"id\": \"2\", \"text\": \"번역문\"}, ...]"
                 )
-                for i, row in enumerate(batch_rows):
-                    raw = lines_final[i] if i < len(lines_final) else ""
-                    row["translated"] = raw if (raw and raw.strip()) else AI_TRANSLATE_EMPTY_PLACEHOLDER
+                batch_ok = False
+                batch_error: Optional[Exception] = None
+                line_start = batch_rows[0].get("index", batch_indices[0] + 1)
+                line_end = batch_rows[-1].get("index", batch_indices[-1] + 1)
+
+                def _try_batch_api() -> bool:
+                    nonlocal batch_ok, batch_error
+                    batch_error = None
+                    try:
+                        response = client.models.generate_content(
+                            model=chosen_name, contents=user_prompt, config=config
+                        )
+                        text = (response.text or "").strip()
+                        parsed = _parse_json_translation_response(text)
+                        if parsed is not None and len(parsed) == len(batch_rows):
+                            expected_ids = {str(r.get("index", 0)) for r in batch_rows}
+                            id_to_text: Dict[str, str] = {}
+                            for item in parsed:
+                                if not isinstance(item, dict):
+                                    break
+                                kid = item.get("id") or item.get("id_")
+                                trans = (item.get("text") or item.get("translated") or "").strip()
+                                if kid is not None:
+                                    id_to_text[str(kid)] = trans
+                            if set(id_to_text.keys()) == expected_ids:
+                                for row in batch_rows:
+                                    raw = id_to_text.get(str(row.get("index", "")), "").strip()
+                                    row["translated"] = raw if raw else AI_TRANSLATE_EMPTY_PLACEHOLDER
+                                batch_ok = True
+                        return batch_ok
+                    except Exception as e:
+                        batch_error = e
+                        return False
+
+                # 1차 시도
+                _try_batch_api()
+                # 1차 실패 시 1회 재시도 (10줄 묶음)
+                if not batch_ok:
+                    self.root.after(0, lambda m=f"[경고] 배치 번역 실패. 1회 재시도 (10줄 묶음, Line {line_start}~{line_end})...": self._append_log(m))
+                    _try_batch_api()
+                # 2차 실패 시 단일 번역(1줄씩) 폴백
+                if not batch_ok:
+                    if batch_error:
+                        err_msg = str(batch_error)
+                        if "429" in err_msg or "Resource Exhausted" in err_msg or "quota" in err_msg.lower() or "exceeded" in err_msg.lower():
+                            return (False, "API 사용량이 초과되었습니다. 잠시 후 다시 시도하거나 API 키를 확인해주세요. (429)", None)
+                        if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                            return (False, f"503_UNAVAILABLE|{chosen_name}", None)
+                    self.root.after(0, lambda m=f"[경고] 배치 번역 실패 (순번 불일치). 해당 구간(Line {line_start}~{line_end}) 단일 번역으로 재시도합니다.": self._append_log(m))
+                    fallback_ok, fallback_err = _translate_chunk_single_fallback(
+                        client, config, chosen_name, batch_rows, target_lang, system_instruction, log_cb
+                    )
+                    if not fallback_ok and fallback_err:
+                        if "503_UNAVAILABLE" in fallback_err:
+                            return (False, fallback_err, None)
+                        if "429" in fallback_err or "API 사용량" in fallback_err:
+                            return (False, fallback_err, None)
+                        return (False, fallback_err, None)
+                    for row in batch_rows:
+                        if not (row.get("translated") or "").strip():
+                            row["translated"] = "[통신 오류]"
 
                 # 빈줄 감지 시 로그 (모든 모드)
                 empty_count = sum(1 for r in batch_rows if (r.get("translated") or "").strip() == "" or r.get("translated") == AI_TRANSLATE_EMPTY_PLACEHOLDER)
@@ -2421,8 +2599,9 @@ class SrtVerifierMergerApp:
                     end_1 = batch_rows[-1].get("index", batch_indices[-1] + 1)
                     msg = f"Line {start_1}-{end_1}: 빈 줄 {empty_count}건 감지되어 <빈줄> 처리"
                     self.root.after(0, lambda m=msg: self._append_log(m))
-                # QA 검수: 글자 수 초과, 인코딩 깨짐 (예외 로그와 동일 강조)
-                _run_qa_checks(batch_rows, log_cb)
+                # QA 검수: 45자 초과·인코딩 깨짐 모두 실시간 로그 출력
+                overflow_cb = lambda m: self.root.after(0, lambda msg=m: self._append_length_warning_log(msg))
+                _run_qa_checks(batch_rows, log_cb, overflow_callback=overflow_cb)
                 # 모두 번역 모드: 진행률 갱신 + 그리드 즉시 갱신
                 if self._translate_all_mode_active:
                     if num_batches > 0:
@@ -2510,6 +2689,7 @@ class SrtVerifierMergerApp:
 
         self.status_var.set("AI 번역 중...")
         self.ai_translate_btn.config(state="disabled")
+        # (45자 초과 경고는 실시간 출력 — 수집 리스트 불필요)
         # 로그 뷰어 표시 및 작업 시작 로그
         self._append_log(f"AI 번역 작업 시작 (대상: {total}줄, {target_lang})")
         if is_translate_all:
