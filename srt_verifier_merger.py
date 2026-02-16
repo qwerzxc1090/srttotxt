@@ -24,6 +24,27 @@ try:
 except ImportError:
     _HAS_PIL = False
 
+# Windows IME 조합 강제 확정을 위한 IMM API
+try:
+    import ctypes
+    import ctypes.wintypes
+    _imm32 = ctypes.WinDLL("imm32", use_last_error=True)
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _imm32.ImmGetContext.argtypes = [ctypes.wintypes.HWND]
+    _imm32.ImmGetContext.restype = ctypes.wintypes.HANDLE
+    _imm32.ImmNotifyIME.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
+                                     ctypes.wintypes.DWORD, ctypes.wintypes.DWORD]
+    _imm32.ImmNotifyIME.restype = ctypes.wintypes.BOOL
+    _imm32.ImmReleaseContext.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.HANDLE]
+    _imm32.ImmReleaseContext.restype = ctypes.wintypes.BOOL
+    _user32.GetFocus.argtypes = []
+    _user32.GetFocus.restype = ctypes.wintypes.HWND
+    _NI_COMPOSITIONSTR = 0x0015
+    _CPS_COMPLETE = 0x0001
+    _HAS_IMM = True
+except (OSError, AttributeError):
+    _HAS_IMM = False
+
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -57,6 +78,9 @@ MANUAL_SIMPLE = """SRT 자막 검수 및 병합 도구 (SubBridge)
 • 글자 크기: 상단 우측 5단계 (저장됨)
 • 번역 셀 더블클릭: 번역 열만 수정 가능, 병합 시 반영
 • 검색: Ctrl+F → 검색창, 원본/번역 모두 검색
+• 검토 필요 찾기: 45자 초과 또는 "빈줄" 항목을 순차 이동하며 검토
+• 주황색 강조: 45자 초과 / "빈줄" 포함 번역 텍스트 자동 표시
+• 단축키: F4(검토 찾기), F3(용어집), Ctrl+S(병합), Ctrl+Enter(AI번역), ↑↓/PgUp/PgDn(탐색)
 ? 클릭 시 자세한 메뉴얼 표시"""
 
 MANUAL_DETAILED = """■ SRT 자막 검수 및 병합 도구 (SubBridge) — 자세한 메뉴얼
@@ -71,7 +95,7 @@ MANUAL_DETAILED = """■ SRT 자막 검수 및 병합 도구 (SubBridge) — 자
 【2. 상단 버튼 및 설정】
   • 원본 SRT 열기: .srt 자막 파일을 엽니다. (컬럼 1: 순번/타임코드, 컬럼 2: 원본 텍스트, 컬럼 3: 번역 텍스트)
   • 번역 TXT 열기: 번역된 한 줄씩 텍스트를 불러와 컬럼 3에 순서대로 채웁니다.
-  • AI 번역하기: Gemini API로 원본 텍스트를 번역합니다. API 키는 exe/프로그램 폴더의 .env 파일에 GEMINI_API_KEY=... 로 넣어 주세요.
+  • AI 번역하기: Gemini API로 원본 텍스트를 번역합니다.
   • 모두 번역: 체크 시 [번역 범위]에 입력한 시작 번호부터 끝까지 전체를 번역합니다. 체크 해제 시 범위 입력(예: 1-10, 1,3,5)으로 구간만 번역(최대 50개).
   • 번역 범위: 일반 모드에서는 "1-10" 또는 "1,3,5" 형식. 모두 번역 모드에서는 시작 순번만 입력(예: 1).
   • AI 모델: 자동 또는 고정 모델(gemini-2.5-flash 등) 선택. 저장됩니다.
@@ -88,19 +112,37 @@ MANUAL_DETAILED = """■ SRT 자막 검수 및 병합 도구 (SubBridge) — 자
   • 스크롤 가능, 홀/짝 행 색 구분.
   • SRT 블록 수와 TXT 줄 수가 다르면 경고 후에도 로드되며, 화면에서 어긋난 부분을 확인할 수 있습니다.
   • 번역 텍스트 직접 수정: [번역 텍스트] 열 셀 더블클릭 → 입력창에서 수정. Enter 또는 다른 곳 클릭으로 저장, Esc로 취소. 병합 시 반영됩니다.
+  • 주황색 강조 표시: 번역 텍스트가 45자를 초과하거나 "빈줄"을 포함하면 해당 행이 주황색으로 표시됩니다.
+    수정 후 조건이 해소되면 자동으로 기본 색상으로 복원됩니다.
 
-【4. 하단 검색】
+【4. 하단 검색 및 검토 필요 찾기】
   • 검색창에 단어 입력 후 [찾기(Find)] 또는 Enter: 원본·번역 양쪽에서 검색, 다음 결과로 이동.
   • Ctrl+F: 검색 입력창으로 포커스 이동.
+  • 검토 필요 찾기 (총 N건): 45자 초과 또는 "빈줄" 포함 항목의 개수를 실시간으로 표시합니다.
+    버튼 클릭 시 다음 경고 항목으로 자동 이동하며, 마지막 항목 이후 처음으로 되돌아갑니다.
+    항목이 0건이면 버튼이 비활성화됩니다. 번역·편집·파일 로드 시 카운트가 자동 갱신됩니다.
 
-【5. 기본 파일명】
+【5. 작업 내용 로그】
+  • 상단 [작업 내용] 체크박스를 켜면 로그 창이 표시됩니다.
+  • 45자 초과 경고는 번역 중 발생 즉시 실시간으로 로그에 출력됩니다.
+    형식: [경고] Line {번호} 45자 초과.(길이:{실제글자수}자)
+
+【6. 단축키】
+  • F4: 검토 필요 찾기 (다음 경고 항목으로 이동)
+  • F3: 용어집 설정 창 열기
+  • Ctrl+S: 병합하기 (SRT 저장)
+  • Ctrl+Enter: AI 번역 시작
+  • Ctrl+F: 검색 입력창 포커스
+  • ↑/↓: Treeview 항목 위/아래 이동
+  • Page Up/Down: 20행 단위 페이지 이동
+
+【7. 기본 파일명】
   • 추출: (원본 SRT 파일이름)_(언어코드).txt  예: video_KR.txt
   • 병합(번역 TXT를 연 경우): (번역 TXT 파일이름)_(AI언어코드)(_flash 등).srt
   • 병합(번역 TXT를 안 연 경우): (원본 SRT 파일이름)_(AI언어코드)(_flash 등).srt
   • AI 번역 사용 시 병합 파일명에 모델 접미사(_flash, _flash_lite, _pro)가 붙을 수 있습니다.
 
-【6. API 키 및 설정 저장】
-  • Gemini API: exe(또는 프로그램) 폴더에 .env 파일을 만들고 한 줄 입력: GEMINI_API_KEY=여기에_키_입력
+【8. 설정 저장】
   • 언어 선택, 글자 크기, AI 모델, AI 대상 언어, 용어집 등은 설정 파일(settings.json)에 저장되어 재실행 시 유지됩니다."""
 
 
@@ -1123,7 +1165,7 @@ class SrtVerifierMergerApp:
         # 1행: 원본 SRT | 번역 TXT | [AI번역 그룹] | 모두 번역 | 번역 범위 | (weight) | 병합하기 | 글자 크기
         ttk.Button(top, text="원본 SRT 열기", command=self._on_open_srt).grid(row=0, column=0, padx=4)
         ttk.Button(top, text="번역 TXT 열기", command=self._on_open_txt).grid(row=0, column=1, padx=4)
-        self.ai_translate_btn = ttk.Button(top, text="AI 번역하기", command=self._on_ai_translate)
+        self.ai_translate_btn = ttk.Button(top, text="AI 번역 (Ctrl+Enter)", command=self._on_ai_translate)
         self.ai_translate_btn.grid(row=0, column=2, padx=4)
         # 모두 번역 체크박스 (AI 번역 / 범위 입력 사이)
         self.translate_all_chk = ttk.Checkbutton(
@@ -1159,10 +1201,10 @@ class SrtVerifierMergerApp:
         self.ai_lang_combo = ttk.Combobox(top, values=LANG_DISPLAYS, state="readonly", width=10)
         self.ai_lang_combo.grid(row=0, column=8, padx=4)
         self.ai_lang_combo.bind("<<ComboboxSelected>>", lambda e: self._save_preferences())
-        self.glossary_btn = ttk.Button(top, text="용어집 설정", command=self._on_glossary_settings)
+        self.glossary_btn = ttk.Button(top, text="용어집 설정 (F3)", command=self._on_glossary_settings)
         self.glossary_btn.grid(row=0, column=9, padx=4)
         top.columnconfigure(10, weight=1)
-        self.merge_btn = ttk.Button(top, text="병합하기(Merge)", command=self._on_merge)
+        self.merge_btn = ttk.Button(top, text="병합하기 (Ctrl+S)", command=self._on_merge)
         self.merge_btn.grid(row=0, column=11, padx=4)
         self.log_viewer_chk = ttk.Checkbutton(
             top,
@@ -1231,12 +1273,20 @@ class SrtVerifierMergerApp:
         ttk.Button(bottom, text="찾기(Find) Ctrl+F", command=self._on_find).grid(row=0, column=2, padx=4)
         self.root.bind("<Control-f>", lambda e: (self._focus_search_entry(), "break")[-1])
 
+        # 검토 필요 찾기 버튼 (경고 항목 순차 이동)
+        self._warning_nav_index: int = -1  # 현재 네비게이션 위치 (-1 = 시작 전)
+        self._warning_btn_var = tk.StringVar(value="검토 필요 찾기 (F4) - 총 0건")
+        self.warning_nav_btn = ttk.Button(
+            bottom, textvariable=self._warning_btn_var, command=self._on_warning_nav
+        )
+        self.warning_nav_btn.grid(row=0, column=3, padx=(12, 4))
+
         self.status_var = tk.StringVar(value="준비됨. 원본 SRT 또는 번역 TXT를 열어주세요.")
         status = ttk.Label(bottom, textvariable=self.status_var, relief="sunken", anchor="w")
-        status.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        status.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_bar = ttk.Progressbar(bottom, variable=self.progress_var, maximum=100)
-        self.progress_bar.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        self.progress_bar.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         self.progress_bar.grid_remove()  # 번역 중에만 표시
         self._progress_after_id: Optional[str] = None  # Fake Progress 타이머 (root.after id)
         self._translation_done_flag = False
@@ -1246,6 +1296,25 @@ class SrtVerifierMergerApp:
         self._load_preferences()
         self._update_merge_button_state()  # 초기: 병합하기 비활성화
         self._update_export_and_ai_translate_state()  # 초기: 원본 없음 → 추출/AI번역 비활성화
+        self._update_warning_count()  # 초기: 경고 0건 → 버튼 비활성화
+
+        # ---- 전역 단축키 바인딩 ----
+        self.root.bind("<F4>", self._on_warning_nav)
+        self.root.bind("<F3>", self._on_glossary_settings)
+        self.root.bind("<Control-s>", self._on_merge)
+        self.root.bind("<Control-S>", self._on_merge)
+        self.root.bind("<Control-Return>", self._on_ai_translate)
+        # ---- Treeview 방향키 & 페이지 네비게이션 (Treeview + 전역) ----
+        # Treeview 자체 기본 Up/Down 동작을 차단하고 커스텀 핸들러로 대체
+        self.tree.bind("<Up>", self._on_tree_key_up)
+        self.tree.bind("<Down>", self._on_tree_key_down)
+        self.tree.bind("<Prior>", self._on_tree_page_up)    # Page Up
+        self.tree.bind("<Next>", self._on_tree_page_down)    # Page Down
+        # Treeview에 포커스가 없을 때도 동작하도록 전역 바인딩 추가
+        self.root.bind("<Up>", self._on_tree_key_up)
+        self.root.bind("<Down>", self._on_tree_key_down)
+        self.root.bind("<Prior>", self._on_tree_page_up)
+        self.root.bind("<Next>", self._on_tree_page_down)
 
     def _on_help_enter(self, event: tk.Event) -> None:
         """? 위젯에 마우스 진입 시 잠시 후 간단 메뉴얼 툴팁 표시."""
@@ -1422,6 +1491,7 @@ class SrtVerifierMergerApp:
             tag = f"warning_{stripe}" if needs_warning else stripe
             self.tree.item(iid, tags=(tag,))
             self._update_merge_button_state()
+            self._update_warning_count()
 
     def _cancel_inplace_edit(self) -> None:
         """인라인 편집 취소(입력창만 제거)."""
@@ -1430,6 +1500,142 @@ class SrtVerifierMergerApp:
         self._inplace_entry = None
         self._inplace_iid = None
         self._inplace_row_index = None
+
+    # ---- 검토 필요 찾기 (경고 네비게이션) ----
+
+    @staticmethod
+    def _is_warning_text(text: str) -> bool:
+        """번역 텍스트가 경고 조건(45자 초과 또는 '빈줄' 포함)에 해당하는지 판별."""
+        if "빈줄" in text:
+            return True
+        for ln in text.replace("<br/>", "\n").split("\n"):
+            if ln.strip() and len(ln.strip()) > QA_MAX_CHARS:
+                return True
+        return False
+
+    def _get_warning_indices(self) -> list:
+        """경고 조건에 해당하는 행 인덱스 목록을 반환."""
+        indices = []
+        for i, row in enumerate(self.rows):
+            trans = row.get("translated", "") or ""
+            if self._is_warning_text(trans):
+                indices.append(i)
+        return indices
+
+    def _update_warning_count(self) -> None:
+        """경고 항목 개수를 세어 버튼 텍스트를 갱신하고, 0건이면 비활성화."""
+        count = len(self._get_warning_indices())
+        self._warning_btn_var.set(f"검토 필요 찾기 (F4) - 총 {count}건")
+        if count == 0:
+            self.warning_nav_btn.state(["disabled"])
+            self._warning_nav_index = -1
+        else:
+            self.warning_nav_btn.state(["!disabled"])
+
+    # ---- Treeview 방향키 & 페이지 네비게이션 ----
+
+    def _tree_select_by_index(self, row_index: int) -> None:
+        """지정 행 인덱스를 Treeview에서 선택·포커스·스크롤."""
+        if row_index < 0 or row_index >= len(self.rows):
+            return
+        iid = self._tree_iid(row_index)
+        if not self.tree.exists(iid):
+            return
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self.tree.see(iid)
+
+    def _get_current_tree_row(self) -> int:
+        """현재 Treeview에서 선택된 행 인덱스 반환. 없으면 -1."""
+        sel = self.tree.selection()
+        if not sel:
+            return -1
+        try:
+            return int(sel[0].replace("r_", ""))
+        except (ValueError, IndexError):
+            return -1
+
+    def _on_tree_key_up(self, event=None) -> str:
+        """위 화살표: 이전 항목으로 이동."""
+        if self._inplace_entry and self._inplace_entry.winfo_exists():
+            return ""  # 인라인 편집 중에는 무시
+        current = self._get_current_tree_row()
+        if current <= 0:
+            self._tree_select_by_index(0)
+        else:
+            self._tree_select_by_index(current - 1)
+        return "break"
+
+    def _on_tree_key_down(self, event=None) -> str:
+        """아래 화살표: 다음 항목으로 이동."""
+        if self._inplace_entry and self._inplace_entry.winfo_exists():
+            return ""  # 인라인 편집 중에는 무시
+        current = self._get_current_tree_row()
+        last = len(self.rows) - 1
+        if current < 0:
+            self._tree_select_by_index(0)
+        elif current >= last:
+            self._tree_select_by_index(last)
+        else:
+            self._tree_select_by_index(current + 1)
+        return "break"
+
+    def _on_tree_page_up(self, event=None) -> str:
+        """Page Up: 20행 위로 이동."""
+        if self._inplace_entry and self._inplace_entry.winfo_exists():
+            return ""
+        current = self._get_current_tree_row()
+        target = max(0, current - 20) if current >= 0 else 0
+        self._tree_select_by_index(target)
+        return "break"
+
+    def _on_tree_page_down(self, event=None) -> str:
+        """Page Down: 20행 아래로 이동."""
+        if self._inplace_entry and self._inplace_entry.winfo_exists():
+            return ""
+        current = self._get_current_tree_row()
+        last = len(self.rows) - 1
+        target = min(last, current + 20) if current >= 0 else min(last, 20)
+        self._tree_select_by_index(max(0, target))
+        return "break"
+
+    def _on_warning_nav(self, event=None) -> None:
+        """다음 경고 항목으로 순차 이동. 마지막 도달 후 처음으로 되돌아감(wrap-around)."""
+        warning_indices = self._get_warning_indices()
+        if not warning_indices:
+            self.status_var.set("검토할 항목이 없습니다.")
+            return
+
+        # 현재 선택된 행 기준으로 다음 경고 항목 찾기
+        current_sel = self.tree.selection()
+        current_row = -1
+        if current_sel:
+            iid = current_sel[0]
+            try:
+                current_row = int(iid.replace("r_", ""))
+            except ValueError:
+                current_row = -1
+
+        # 현재 행보다 뒤에 있는 첫 번째 경고 항목 찾기
+        next_idx = None
+        for idx in warning_indices:
+            if idx > current_row:
+                next_idx = idx
+                break
+        # wrap-around: 뒤에 없으면 처음으로
+        if next_idx is None:
+            next_idx = warning_indices[0]
+
+        # Treeview 포커스 이동
+        iid = self._tree_iid(next_idx)
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self.tree.see(iid)
+
+        # 상태바에 현재 위치 표시
+        pos = warning_indices.index(next_idx) + 1
+        total = len(warning_indices)
+        self.status_var.set(f"검토 필요 항목 {pos}/{total} (Line {self.rows[next_idx].get('index', '?')})")
 
     def _refresh_tree(self):
         """self.rows 기준으로 Treeview 갱신 (Zebra stripe 적용). 행 간격 한 줄 기준 고정."""
@@ -1537,6 +1743,7 @@ class SrtVerifierMergerApp:
         self.tree.heading("translated", text="번역 텍스트 (Translated)")
         self._update_merge_button_state()
         self._update_export_and_ai_translate_state()
+        self._update_warning_count()
 
     def _get_selected_lang_code(self) -> str:
         """추출하기용 언어 드롭다운에서 선택된 언어 코드 반환 (예: EN, KR)."""
@@ -1790,7 +1997,7 @@ class SrtVerifierMergerApp:
         except Exception:
             pass
 
-    def _on_glossary_settings(self) -> None:
+    def _on_glossary_settings(self, event=None) -> None:
         """용어집 설정 팝업: 독립 언어 선택 + 2열 Treeview + 글자 크기 + 추가/수정/삭제."""
         # 초기: 메인 프로그램 선택 언어로 동기화
         init_lang = (self.ai_lang_combo.get() or "").strip() or LANG_DISPLAYS[0]
@@ -1977,7 +2184,43 @@ class SrtVerifierMergerApp:
         orig_entry.bind("<Return>", lambda e: trans_entry.focus_set())
         trans_entry.bind("<Return>", lambda e: add_or_update())
 
+        def _force_ime_commit() -> None:
+            """Windows IMM API를 사용하여 IME 조합 중인 한글을 강제 확정(commit).
+            GetFocus()로 현재 포커스된 Entry 위젯의 실제 HWND를 가져와서
+            해당 위젯의 IME 컨텍스트에 직접 CPS_COMPLETE를 보냅니다."""
+            if not _HAS_IMM:
+                return
+            try:
+                # 현재 포커스를 가진 위젯(Entry)의 실제 Windows HWND 획득
+                hwnd = _user32.GetFocus()
+                if not hwnd:
+                    return
+                himc = _imm32.ImmGetContext(hwnd)
+                if himc:
+                    _imm32.ImmNotifyIME(himc, _NI_COMPOSITIONSTR, _CPS_COMPLETE, 0)
+                    _imm32.ImmReleaseContext(hwnd, himc)
+            except Exception:
+                pass
+
         def save_and_close() -> None:
+            # Windows IMM API로 IME 조합 중인 한글 강제 확정
+            _force_ime_commit()
+            win.focus_set()
+            win.update()
+            # 미등록 텍스트 감지: 입력창에 작성 중인 단어가 있으면 확인 팝업
+            has_orig = (orig_var.get() or "").strip()
+            has_trans = (trans_var.get() or "").strip()
+            if has_orig or has_trans:
+                result = messagebox.askyesnocancel(
+                    "저장 확인",
+                    "입력창에 작성 중인 단어가 있습니다.\n이 단어를 용어집에 적용한 후 저장하시겠습니까?",
+                    parent=win,
+                )
+                if result is None:  # 취소 → 창 유지
+                    return
+                if result:  # 예 → 추가/수정 후 저장
+                    add_or_update()
+                # 아니요 → 입력창 무시하고 저장
             self._glossary_data[current_glossary_lang[0]] = tree_to_dict()
             self._save_glossary_data()
             self._save_glossary_layout(win, tree)
@@ -1985,9 +2228,20 @@ class SrtVerifierMergerApp:
             win.destroy()
 
         ttk.Button(btn_row, text="추가/수정", command=add_or_update).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_row, text="삭제", command=delete_selected).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_row, text="저장 후 닫기", command=save_and_close).pack(side="right", padx=4)
+        ttk.Button(btn_row, text="삭제 (Del)", command=delete_selected).pack(side="left", padx=(0, 4))
+        ttk.Button(btn_row, text="저장 후 닫기 (Ctrl+S)", command=save_and_close).pack(side="right", padx=4)
         win.protocol("WM_DELETE_WINDOW", save_and_close)
+
+        # ---- 용어집 창 전용 단축키 ----
+        win.bind("<Delete>", lambda e: delete_selected())
+        def _on_ctrl_s(e):
+            _force_ime_commit()          # 키 이벤트 시점에 즉시 IME 확정
+            win.after(50, save_and_close) # 약간의 지연 후 저장 (IME 처리 완료 대기)
+            return "break"
+        win.bind("<Control-s>", _on_ctrl_s)
+        win.bind("<Control-S>", _on_ctrl_s)
+        win.bind("<Escape>", lambda e: save_and_close())
+
         orig_entry.focus_set()
 
     def _on_translate_range_focus_in(self, event: tk.Event) -> None:
@@ -2350,6 +2604,7 @@ class SrtVerifierMergerApp:
             self._refresh_tree()
             self.tree.heading("translated", text="번역 텍스트 (AI)")
             self._update_merge_button_state()
+            self._update_warning_count()
             model_label = chosen_name or "알 수 없음"
             per_line = (elapsed / total) if (elapsed > 0 and total > 0) else 0
             speed_info = f", {elapsed:.1f}s, {per_line:.2f}s/ea" if elapsed > 0 else ""
@@ -2371,6 +2626,7 @@ class SrtVerifierMergerApp:
         else:
             err_msg = arg1 or "알 수 없는 오류"
             self._refresh_tree()
+            self._update_warning_count()
             is_cancel = "사용자 중단" in str(err_msg)
             self.status_var.set("AI 번역 중단." if is_cancel else "AI 번역 실패.")
             if is_cancel:
@@ -2564,13 +2820,9 @@ class SrtVerifierMergerApp:
                         batch_error = e
                         return False
 
-                # 1차 시도
+                # 배치 시도
                 _try_batch_api()
-                # 1차 실패 시 1회 재시도 (10줄 묶음)
-                if not batch_ok:
-                    self.root.after(0, lambda m=f"[경고] 배치 번역 실패. 1회 재시도 (10줄 묶음, Line {line_start}~{line_end})...": self._append_log(m))
-                    _try_batch_api()
-                # 2차 실패 시 단일 번역(1줄씩) 폴백
+                # 배치 실패 시 단일 번역(1줄씩) 폴백
                 if not batch_ok:
                     if batch_error:
                         err_msg = str(batch_error)
@@ -2632,7 +2884,7 @@ class SrtVerifierMergerApp:
         elapsed = time.time() - self._translation_start_time
         self.root.after(0, lambda: self._on_translation_done(result[0], result[1], result[2], elapsed))
 
-    def _on_ai_translate(self):
+    def _on_ai_translate(self, event=None):
         """AI 번역하기: Fake Progress 표시 후 백그라운드 스레드에서 Gemini API 번역 실행."""
         if not _HAS_GEMINI or genai is None:
             messagebox.showerror("오류", "Gemini API를 사용하려면\npip install google-genai\n를 실행해 주세요.")
@@ -2743,7 +2995,7 @@ class SrtVerifierMergerApp:
             return "_pro"
         return ""
 
-    def _on_merge(self):
+    def _on_merge(self, event=None):
         """[컬럼 1] 타임코드 + [컬럼 3] 번역으로 SRT 저장."""
         if not self.rows:
             messagebox.showwarning("알림", "먼저 원본 SRT를 열어주세요.")

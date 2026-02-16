@@ -1,0 +1,9 @@
+v0010: 전역 단축키, 용어집 UX 개선, IME 버그 수정 시도
+
+- 전역 단축키 추가 (F4/F3/Ctrl+S/Ctrl+Enter)
+- Treeview 방향키 1줄 이동 수정
+- 용어집 전용 단축키 (Del/Ctrl+S/Esc) 및 자동완성
+- 용어집 미등록 텍스트 안전장치 (askyesnocancel)
+- Windows IMM API를 통한 IME 조합 강제 확정 시도
+- 2차 재시도 폴백 전략 제거
+- readme_dev.md PRD 문서 업데이트
